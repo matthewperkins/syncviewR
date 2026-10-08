@@ -1,3 +1,5 @@
+<img src="assets/icon.png" alt="syncviewR icon: an engraved mouse head with its headstage and optical ferrule, above a smoked-drum heart trace" width="128" align="right">
+
 # syncviewR
 
 A Rust port of [syncview](https://github.com/matthewperkins/syncview): view Open Ephys recordings

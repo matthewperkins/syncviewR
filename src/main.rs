@@ -71,6 +71,10 @@ struct Cli {
     dump_frames: Option<Vec<String>>,
 }
 
+/// Window, Dock and ⌘-Tab icon (assets/icon.svg, made by assets/make_icon.py; rendered with
+/// `rsvg-convert -w 512 -h 512`).
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
     ffmpeg_next::init().context("initialising FFmpeg")?;
@@ -129,7 +133,11 @@ fn main() -> Result<()> {
     };
     let native = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
-        viewport: egui::ViewportBuilder::default().with_inner_size([1700.0, 1000.0]).with_title(&title),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1700.0, 1000.0])
+            .with_title(&title)
+            .with_app_id("syncviewr")
+            .with_icon(Arc::new(eframe::icon_data::from_png_bytes(ICON_PNG).context("decoding the app icon")?)),
         ..Default::default()
     };
     eframe::run_native("syncviewr", native, Box::new(move |cc| Ok(Box::new(app::App::new(cc, rec, cache, opts)))))
