@@ -21,7 +21,22 @@ cache folder as the Python version. Not yet ported: clip export.
 
 ## Install
 
-You need Rust (1.85 or newer) and a C compiler. The `static-ffmpeg` option compiles FFmpeg into
+**Prebuilt (macOS, Apple silicon).** In Terminal:
+
+```bash
+cd ~/Downloads
+curl -L -O https://github.com/matthewperkins/syncviewR/releases/latest/download/syncviewr-macos-arm64.zip
+unzip -o syncviewr-macos-arm64.zip syncviewr
+./syncviewr --demo
+```
+
+To run it from any folder, move it onto your PATH: `sudo mv syncviewr /usr/local/bin/`. The build is
+not signed with an Apple Developer ID. A file downloaded with `curl` isn't marked as quarantined,
+so macOS runs it straight away. If you download the zip with a browser instead, clear the flag once
+with `xattr -d com.apple.quarantine syncviewr`, or use System Settings → Privacy & Security →
+Open Anyway. Other platforms, and Intel Macs, build from source as below.
+
+**From source.** You need Rust (1.85 or newer) and a C compiler. The `static-ffmpeg` option compiles FFmpeg into
 syncviewR, so nothing else is needed and the program keeps working when system packages change.
 
 ```bash
