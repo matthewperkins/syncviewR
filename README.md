@@ -49,9 +49,9 @@ Controls are as in syncview: scroll = zoom time; sideways swipe, Shift+scroll or
 ←/→ one video frame (Shift: 10 % of the view), PgUp/PgDn, Home/End, Space play, [ / ] speed, +/- zoom.
 
 **Channel table** (right): Show, Label, Ch, Ref (bipolar reference), Mode, Low/High Hz (blank =
-no filter edge), Notch (e.g. `60` or `60,180`), Extra (`order=3 smooth_ms=10 env_lp=40 plot_fs=1000
+no filter edge), Notch (e.g. `60` or `60,180`), DSP wzrd (`order=3 smooth_ms=10 env_lp=40 plot_fs=1000
 win_s=30`), Y range (`auto` or `lo, hi`). Text fields apply on Enter or when you click away; input
-that doesn't parse reverts. Changing a row's mode resets its band and Extra settings to that mode's
+that doesn't parse reverts. Changing a row's mode resets its band and DSP wzrd settings to that mode's
 defaults (Python syncview keeps the old band). Click a row's number to select it for Up / Down /
 Remove and as the template for Add. **Load…/Save…** read and write presets in the Python format
 (time base, rows, overview); **Video…** attaches a video.

@@ -785,7 +785,7 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.label("Channels").on_hover_text(
                 "Low/High Hz: filter band (blank = none). Notch: e.g. 60 or 60,180.\n\
-                 Extra: key=value for order, smooth_ms, env_lp, plot_fs, win_s.\n\
+                 DSP wzrd: key=value for order, smooth_ms, env_lp, plot_fs, win_s.\n\
                  Y range: 'auto' or 'lo, hi'. Text fields apply on Enter or when you click away.\n\
                  ⌘/Ctrl+scroll over a trace scales its Y range; double-click a trace resets it to auto.\n\
                  Click a row's number to select it for Up / Down / Remove, and as the template for Add.",
@@ -811,8 +811,18 @@ impl App {
         refs.extend(names.iter().cloned());
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
             egui::Grid::new("channels").striped(true).spacing([4.0, 5.0]).show(ui, |ui| {
-                for h in ["", "Show", "Label", "Ch", "Ref", "Mode", "Low Hz", "High Hz", "Notch", "Extra", "Y range"] {
-                    ui.label(egui::RichText::new(h).small());
+                for h in ["", "Show", "Label", "Ch", "Ref", "Mode", "Low Hz", "High Hz", "Notch", "DSP wzrd", "Y range"] {
+                    let l = ui.label(egui::RichText::new(h).small());
+                    if h == "DSP wzrd" {
+                        l.on_hover_text(
+                            "key=value, space separated; blank = the mode's defaults.\n\
+                             order      Butterworth order of the Low/High Hz band (all modes; 4 hilo/envelope, 2 slow/bandpower)\n\
+                             smooth_ms  envelope: moving-average window after rectifying (20)\n\
+                             env_lp     envelope: final low-pass, Hz (40)\n\
+                             plot_fs    slow/envelope/bandpower: stored & drawn sample rate, Hz (1000/1000/10)\n\
+                             win_s      bandpower: RMS window, s (30)",
+                        );
+                    }
                 }
                 ui.end_row();
                 for i in 0..self.specs.len() {
