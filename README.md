@@ -5,8 +5,12 @@ side by side with a behaviour video, frame-locked to the camera trigger. Built w
 [egui](https://github.com/emilk/egui)/eframe for the interface, [wgpu](https://wgpu.rs) (Vulkan,
 Metal, DirectX) for drawing the traces, and FFmpeg (`ffmpeg-next`) for video.
 
-![syncviewR on macOS: video frame-locked to 16 channels of slow-wave and EMG traces, channel table, and
-whole-session overview](docs/screenshot-macos.png)
+![syncviewR on macOS: video frame-locked to masseter and digastric EMG and antrum and duodenum slow
+waves, with the channel table and a whole-session slow-wave power overview](docs/screenshot-macos.png)
+
+*syncviewR on macOS: 4 of 16 channels of a 10-minute excerpt (masseter and digastric EMG, antrum and
+duodenum slow waves) with the antrum's slow-wave power across the excerpt (bottom; the shaded box is
+the current view).*
 
 MIT-licensed (see `LICENSE`). Written mostly by an AI model; see [Provenance](#provenance).
 
