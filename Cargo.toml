@@ -11,7 +11,7 @@ anyhow = "1.0.104"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-ffmpeg-next = "9"
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
 memmap2 = "0.9.11"
 num-complex = "0.4.6"
 rayon = "1.12.0"
@@ -20,5 +20,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1_smol = "1.0.1"
 
+[features]
+# Compile FFmpeg from source into the binary (LGPL, no external codec libraries): no system FFmpeg
+# needed to build or run. Needs git, a C compiler and make (+ nasm on x86-64); the first build takes
+# several minutes longer.
+static-ffmpeg = ["ffmpeg-next/build"]
+
 [profile.release]
-debug = "line-tables-only"
+strip = true

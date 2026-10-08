@@ -13,18 +13,30 @@ MIT-licensed (see `LICENSE`). Written mostly by an AI model; see [Provenance](#p
 **Status:** the viewer and channel editor are ported. It reads the same recordings, presets and
 cache folder as the Python version. Not yet ported: clip export.
 
-## Build
+## Install
 
-Needs Rust (1.85+) and FFmpeg's development libraries.
+You need Rust (1.85 or newer) and a C compiler. The `static-ffmpeg` option compiles FFmpeg into
+syncviewR, so nothing else is needed and the program keeps working when system packages change.
 
 ```bash
-# Arch Linux
-sudo pacman -S rust ffmpeg clang
-# macOS
-brew install rust ffmpeg pkg-config
+# macOS (once): Apple's compiler tools and Rust
+xcode-select --install
+brew install rust            # or https://rustup.rs
 
-cargo build --release          # -> target/release/syncviewr
+# then
+cargo install --git https://github.com/matthewperkins/syncviewR --features static-ffmpeg
 ```
+
+That builds and installs the `syncviewr` command into `~/.cargo/bin` (add it to your PATH if your
+shell doesn't find it). The first build takes about 5–10 minutes, most of it compiling FFmpeg. To
+update, run the same command again.
+
+On Linux the same command works; x86-64 also needs `nasm` (e.g. `sudo pacman -S nasm`).
+
+**Building against the system's FFmpeg instead** (faster first build, but it has to be rebuilt
+whenever the system's FFmpeg changes major version): install FFmpeg's libraries and `pkgconf`
+(`brew install ffmpeg pkgconf`, or `sudo pacman -S ffmpeg`) and leave out `--features static-ffmpeg`.
+From a checkout: `cargo build --release` gives `target/release/syncviewr`.
 
 ## Run
 
