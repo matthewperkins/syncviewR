@@ -40,6 +40,110 @@ pub struct Options {
     pub play: bool,
 }
 
+const EXTRA_KEYS: [&str; 5] = ["order", "smooth_ms", "env_lp", "plot_fs", "win_s"];
+
+/// Python's "{:g}": up to 6 significant digits, trailing zeros removed.
+fn g6(x: f64) -> String {
+    if x == 0.0 {
+        return "0".into();
+    }
+    let e = x.abs().log10().floor() as i32;
+    if !(-5..6).contains(&e) {
+        return crate::filters::py_float(x);
+    }
+    let d = (5 - e).max(0) as usize;
+    let s = format!("{x:.d$}");
+    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+}
+
+fn fmt_ylim(y: Option<[f64; 2]>) -> String {
+    match y {
+        None => "auto".into(),
+        Some([a, b]) => format!("{}, {}", g6(a), g6(b)),
+    }
+}
+
+/// Text-field contents of one channel-table row; parsed back into the spec on Enter / focus loss.
+struct RowEdit {
+    lo: String,
+    hi: String,
+    notch: String,
+    extra: String,
+    y: String,
+}
+
+impl RowEdit {
+    fn from_spec(s: &Spec) -> Self {
+        let p = crate::filters::params(s).unwrap_or_default();
+        let band = p.get("band").and_then(|b| b.as_array()).cloned().unwrap_or_default();
+        let edge = |i: usize| band.get(i).and_then(|v| v.as_f64()).map(g6).unwrap_or_default();
+        let notch = match p.get("notch") {
+            Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_f64()).map(g6).collect::<Vec<_>>().join(","),
+            Some(v) => v.as_f64().map(g6).unwrap_or_default(),
+            None => String::new(),
+        };
+        let extra = EXTRA_KEYS
+            .iter()
+            .filter_map(|k| s.extra.get(*k).and_then(|v| v.as_f64()).map(|v| format!("{k}={}", g6(v))))
+            .collect::<Vec<_>>()
+            .join(" ");
+        RowEdit { lo: edge(0), hi: edge(1), notch, extra, y: fmt_ylim(s.ylim) }
+    }
+
+    /// Parse the fields into `s` (fields that don't parse are left as they were).
+    fn apply(&self, s: &mut Spec) {
+        use serde_json::{json, Value};
+        let num = |t: &str| -> Result<Option<f64>, ()> {
+            let t = t.trim();
+            if t.is_empty() || ["none", "-", "–"].contains(&t.to_lowercase().as_str()) {
+                Ok(None)
+            } else {
+                t.parse::<f64>().map(Some).map_err(|_| ())
+            }
+        };
+        if let (Ok(lo), Ok(hi)) = (num(&self.lo), num(&self.hi)) {
+            let current = RowEdit::from_spec(s);
+            if self.lo.trim() != current.lo || self.hi.trim() != current.hi {
+                s.extra.insert("band".into(), json!([lo, hi]));
+            }
+        }
+        let notch: Result<Vec<f64>, _> =
+            self.notch.replace(';', ",").split(',').map(str::trim).filter(|v| !v.is_empty()).map(str::parse::<f64>).collect();
+        if let Ok(n) = notch {
+            if n.is_empty() {
+                s.extra.remove("notch");
+            } else {
+                s.extra.insert("notch".into(), json!(n));
+            }
+        }
+        let mut seen: Vec<&str> = vec![];
+        let text = self.extra.replace(',', " ");
+        for kv in text.split_whitespace() {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            if let (Some(k), Ok(v)) = (EXTRA_KEYS.iter().find(|x| **x == k), v.parse::<f64>()) {
+                let val = if *k == "order" { json!(v.round() as i64) } else { Value::from(v) };
+                s.extra.insert(k.to_string(), val);
+                seen.push(k);
+            }
+        }
+        for k in EXTRA_KEYS {
+            if !seen.contains(&k) {
+                s.extra.remove(k);
+            }
+        }
+        let y: Vec<&str> = self.y.split([',', ';']).map(str::trim).collect();
+        if self.y.trim().eq_ignore_ascii_case("auto") || self.y.trim().is_empty() {
+            s.ylim = None;
+        } else if let [a, b] = y[..] {
+            if let (Ok(a), Ok(b)) = (a.parse::<f64>(), b.parse::<f64>()) {
+                if a < b {
+                    s.ylim = Some([a, b]);
+                }
+            }
+        }
+    }
+}
+
 struct Row {
     spec: Spec,
     key: String,
@@ -72,6 +176,9 @@ pub struct App {
     video_caption: String,
     video_msg: String,
     want_frame: Option<usize>,
+    edits: Vec<RowEdit>,
+    selected: Option<usize>,
+    last_dir: Option<PathBuf>,
     span_text: String,
     goto_text: String,
     status: String,
@@ -170,7 +277,7 @@ impl App {
         let c2 = ctx.clone();
         let window_worker = WindowWorker::new(cache.clone(), move || c2.request_repaint());
         let frames: Vec<f64> = rec.rising_edges(opts.trigger_line).iter().map(|i| *i as f64 / rec.fs).collect();
-        let t = opts.start_time.unwrap_or(frames.first().copied().unwrap_or(0.0));
+        let t = opts.start_time.unwrap_or(frames.first().copied().unwrap_or(0.0)).clamp(0.0, rec.duration());
         let mut app = App {
             builder,
             window_worker,
@@ -193,6 +300,9 @@ impl App {
             video_caption: String::new(),
             video_msg: String::new(),
             want_frame: None,
+            edits: vec![],
+            selected: None,
+            last_dir: None,
             span_text: String::new(),
             goto_text: String::new(),
             status: String::new(),
@@ -234,6 +344,8 @@ impl App {
         self.set_span(p.time_base.unwrap_or(self.span));
         self.overview = p.overview;
         self.specs = p.channels;
+        self.selected = None;
+        self.sync_edits();
         self.set_specs();
     }
 
@@ -474,6 +586,7 @@ impl App {
         };
         row.spec.ylim = Some(new);
         self.specs[row.table_index].ylim = Some(new);
+        self.edits[row.table_index].y = fmt_ylim(Some(new));
     }
 
     fn reset_row_y(&mut self, i: usize) {
@@ -481,6 +594,7 @@ impl App {
         row.spec.ylim = None;
         row.auto = None;
         self.specs[row.table_index].ylim = None;
+        self.edits[row.table_index].y = fmt_ylim(None);
     }
 
     // ------------------------------------------------------------------ input
@@ -583,6 +697,11 @@ impl App {
                 }
             }
             ui.separator();
+            if ui.button("Video…").on_hover_text("attach the video recorded during this session").clicked() {
+                let ctx = ui.ctx().clone();
+                self.choose_video_dialog(&ctx);
+            }
+            ui.separator();
             let fr = self.current_frame().map(|k| format!("   frame {k}")).unwrap_or_default();
             ui.label(egui::RichText::new(format!("t = {}  ({:.3} s){fr}", fmt_time(self.t, None), self.t)).monospace().size(13.0));
         });
@@ -602,43 +721,189 @@ impl App {
         });
     }
 
+    // ------------------------------------------------------------------ channel table
+
+    /// Rebuild the table's text fields from the specs (after loading, reordering, ⌘+scroll, …).
+    fn sync_edits(&mut self) {
+        self.edits = self.specs.iter().map(RowEdit::from_spec).collect();
+    }
+
+    fn preset(&self) -> Preset {
+        Preset { time_base: Some(self.span), channels: self.specs.clone(), overview: self.overview.clone() }
+    }
+
+    fn load_preset_dialog(&mut self) {
+        let mut d = rfd::FileDialog::new().set_title("Load channel preset").add_filter("JSON", &["json"]);
+        if let Some(dir) = &self.last_dir {
+            d = d.set_directory(dir);
+        }
+        let Some(path) = d.pick_file() else { return };
+        self.last_dir = path.parent().map(PathBuf::from);
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|t| serde_json::from_str::<Preset>(&t).map_err(anyhow::Error::from));
+        match parsed {
+            Ok(p) => {
+                self.overview = None;
+                self.apply_preset(p);
+                self.status = format!("loaded preset {}", path.display());
+            }
+            Err(e) => self.dialogs.push(("Could not load preset".into(), format!("{}:\n\n{e:#}", path.display()))),
+        }
+    }
+
+    fn save_preset_dialog(&mut self) {
+        let mut d = rfd::FileDialog::new().set_title("Save channel preset").add_filter("JSON", &["json"]).set_file_name("preset.json");
+        if let Some(dir) = &self.last_dir {
+            d = d.set_directory(dir);
+        }
+        let Some(mut path) = d.save_file() else { return };
+        if path.extension().is_none_or(|e| e != "json") {
+            path.set_extension("json");
+        }
+        self.last_dir = path.parent().map(PathBuf::from);
+        let res = serde_json::to_string_pretty(&self.preset()).map_err(anyhow::Error::from)
+            .and_then(|t| std::fs::write(&path, t + "\n").map_err(anyhow::Error::from));
+        match res {
+            Ok(()) => self.status = format!("saved preset {}", path.display()),
+            Err(e) => self.dialogs.push(("Could not save preset".into(), format!("{}:\n\n{e:#}", path.display()))),
+        }
+    }
+
+    fn choose_video_dialog(&mut self, ctx: &egui::Context) {
+        let mut d = rfd::FileDialog::new().set_title("Video recorded during this session").add_filter("Video", &["mp4", "mkv", "mov", "avi"]);
+        if let Some(dir) = self.video.as_ref().and_then(|v| v.path.parent().map(PathBuf::from)).or(self.last_dir.clone()) {
+            d = d.set_directory(dir);
+        }
+        if let Some(path) = d.pick_file() {
+            self.video_tex = None;
+            self.attach_video(path, ctx);
+        }
+    }
+
     fn channels_ui(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| ui.label("Channels"));
+        ui.vertical_centered(|ui| {
+            ui.label("Channels").on_hover_text(
+                "Low/High Hz: filter band (blank = none). Notch: e.g. 60 or 60,180.\n\
+                 Extra: key=value for order, smooth_ms, env_lp, plot_fs, win_s.\n\
+                 Y range: 'auto' or 'lo, hi'. Text fields apply on Enter or when you click away.\n\
+                 ⌘/Ctrl+scroll over a trace scales its Y range; double-click a trace resets it to auto.\n\
+                 Click a row's number to select it for Up / Down / Remove, and as the template for Add.",
+            )
+        });
         ui.separator();
         let mut changed = false;
+        let mut action: Option<&str> = None;
+        egui::Panel::bottom("channel_buttons").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for (text, tip) in [("Add", "add a row (a copy of the selected one)"), ("Remove", "remove the selected row"),
+                                    ("Up", "move the selected row up"), ("Down", "move the selected row down"),
+                                    ("Load…", "load a channel preset (.json)"), ("Save…", "save rows, time base and overview as a preset")] {
+                    if ui.button(text).on_hover_text(tip).clicked() {
+                        action = Some(text);
+                    }
+                }
+            });
+        });
         let names = self.rec.ch_names.clone();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("channels").striped(true).spacing([8.0, 6.0]).show(ui, |ui| {
-                for h in ["Show", "Label", "Ch", "Mode", "Low Hz", "High Hz"] {
+        let mut refs = vec!["—".to_string()];
+        refs.extend(names.iter().cloned());
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new("channels").striped(true).spacing([4.0, 5.0]).show(ui, |ui| {
+                for h in ["", "Show", "Label", "Ch", "Ref", "Mode", "Low Hz", "High Hz", "Notch", "Extra", "Y range"] {
                     ui.label(egui::RichText::new(h).small());
                 }
                 ui.end_row();
-                for (i, s) in self.specs.iter_mut().enumerate() {
+                for i in 0..self.specs.len() {
+                    if ui.selectable_label(self.selected == Some(i), format!("{:>2}", i + 1)).clicked() {
+                        self.selected = if self.selected == Some(i) { None } else { Some(i) };
+                    }
+                    let s = &mut self.specs[i];
+                    let e = &mut self.edits[i];
                     changed |= ui.checkbox(&mut s.show, "").changed();
                     let mut label = s.label.clone().unwrap_or_default();
-                    if ui.add_sized([110.0, 20.0], egui::TextEdit::singleline(&mut label)).changed() {
+                    if ui.add_sized([92.0, 20.0], egui::TextEdit::singleline(&mut label)).changed() {
                         s.label = Some(label);
                         changed = true;
                     }
-                    egui::ComboBox::from_id_salt(("ch", i)).width(64.0).selected_text(&s.ch).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(("ch", i)).width(54.0).selected_text(&s.ch).show_ui(ui, |ui| {
                         for n in &names {
                             changed |= ui.selectable_value(&mut s.ch, n.clone(), n).changed();
                         }
                     });
-                    egui::ComboBox::from_id_salt(("mode", i)).width(84.0).selected_text(&s.mode).show_ui(ui, |ui| {
-                        for m in MODES {
-                            changed |= ui.selectable_value(&mut s.mode, m.to_string(), m).changed();
+                    let mut r = s.reference.clone().unwrap_or_else(|| "—".into());
+                    egui::ComboBox::from_id_salt(("ref", i)).width(54.0).selected_text(&r).show_ui(ui, |ui| {
+                        for n in &refs {
+                            if ui.selectable_value(&mut r, n.clone(), n).changed() {
+                                changed = true;
+                            }
                         }
                     });
-                    let band = crate::filters::params(s).ok().and_then(|p| p.get("band").cloned());
-                    let edge = |j: usize| band.as_ref().and_then(|b| b.get(j)).and_then(|v| v.as_f64()).map(|v| g3(v)).unwrap_or("–".into());
-                    ui.label(edge(0));
-                    ui.label(edge(1));
+                    s.reference = (r != "—").then_some(r);
+                    let before = s.mode.clone();
+                    egui::ComboBox::from_id_salt(("mode", i)).width(78.0).selected_text(&s.mode).show_ui(ui, |ui| {
+                        for m in MODES {
+                            ui.selectable_value(&mut s.mode, m.to_string(), m);
+                        }
+                    });
+                    if s.mode != before {
+                        // band, order etc. belong to the mode: start the new mode from its defaults
+                        s.extra.remove("band");
+                        for k in EXTRA_KEYS {
+                            s.extra.remove(k);
+                        }
+                        s.ylim = None;
+                        *e = RowEdit::from_spec(s);
+                        changed = true;
+                    }
+                    let mut commit = false;
+                    for (buf, w) in [(&mut e.lo, 42.0), (&mut e.hi, 42.0), (&mut e.notch, 50.0), (&mut e.extra, 92.0), (&mut e.y, 76.0)] {
+                        let resp = ui.add_sized([w, 20.0], egui::TextEdit::singleline(buf));
+                        commit |= resp.lost_focus();
+                    }
+                    if commit {
+                        let before = s.clone();
+                        e.apply(s);
+                        *e = RowEdit::from_spec(s); // show what was understood (invalid input reverts)
+                        changed |= *s != before;
+                    }
                     ui.end_row();
                 }
             });
         });
+        match action {
+            Some("Add") => {
+                let mut s = self.selected.and_then(|i| self.specs.get(i).cloned()).unwrap_or_else(|| Spec::new(&names[0], "slow"));
+                s.ylim = None;
+                s.show = true;
+                self.specs.push(s);
+                self.selected = Some(self.specs.len() - 1);
+                changed = true;
+            }
+            Some("Remove") => {
+                if let Some(i) = self.selected.filter(|i| *i < self.specs.len()) {
+                    self.specs.remove(i);
+                    self.selected = None;
+                    changed = true;
+                }
+            }
+            Some(dir @ ("Up" | "Down")) => {
+                if let Some(i) = self.selected {
+                    let j = if dir == "Up" { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < self.specs.len()) };
+                    if let Some(j) = j {
+                        self.specs.swap(i, j);
+                        self.selected = Some(j);
+                        changed = true;
+                    }
+                }
+            }
+            Some("Load…") => self.load_preset_dialog(),
+            Some("Save…") => self.save_preset_dialog(),
+            _ => {}
+        }
         if changed {
+            self.sync_edits();
             self.set_specs();
         }
     }
@@ -908,7 +1173,7 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::bottom("overview").exact_size(110.0).frame(egui::Frame::NONE.fill(BG).inner_margin(4.0)).show(ui, |ui| self.overview_ui(ui));
         let max_w = (ui.available_width() * 0.45).max(120.0);
-        egui::Panel::right("channels").resizable(true).default_size(470.0f32.min(max_w)).max_size(max_w).show(ui, |ui| self.channels_ui(ui));
+        egui::Panel::right("channels").resizable(true).default_size(700.0f32.min(max_w)).max_size(max_w).show(ui, |ui| self.channels_ui(ui));
         egui::CentralPanel::no_frame().frame(egui::Frame::NONE.fill(BG).inner_margin(4.0)).show(ui, |ui| {
             if self.video.is_some() || self.video_tex.is_some() {
                 let h = ui.available_height();
@@ -926,5 +1191,62 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.screenshot(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn spec() -> Spec {
+        serde_json::from_value(json!({"ch": "CH5", "ref": "CH6", "mode": "hilo", "label": "x",
+            "band": [100.0, 3000.0], "notch": [60.0, 120.0], "order": 3, "ylim": [-50.0, 50.0]})).unwrap()
+    }
+
+    #[test]
+    fn table_fields_round_trip() {
+        let s = spec();
+        let e = RowEdit::from_spec(&s);
+        assert_eq!((e.lo.as_str(), e.hi.as_str(), e.notch.as_str(), e.extra.as_str(), e.y.as_str()),
+                   ("100", "3000", "60,120", "order=3", "-50, 50"));
+        let mut t = s.clone();
+        e.apply(&mut t);
+        assert_eq!(t, s, "unchanged fields must not change the spec (or its cache key)");
+    }
+
+    #[test]
+    fn table_edits() {
+        let mut s = spec();
+        let mut e = RowEdit::from_spec(&s);
+        e.lo = "200".into();
+        e.hi = "".into(); // blank = no low-pass
+        e.notch = "50".into();
+        e.extra = "order=2 smooth_ms=5 bogus=1".into();
+        e.y = "auto".into();
+        e.apply(&mut s);
+        assert_eq!(s.extra["band"], json!([200.0, null]));
+        assert_eq!(s.extra["notch"], json!([50.0]));
+        assert_eq!((s.extra["order"].clone(), s.extra["smooth_ms"].clone()), (json!(2), json!(5.0)));
+        assert!(s.extra.get("bogus").is_none() && s.ylim.is_none());
+        let mut e = RowEdit::from_spec(&s);
+        e.lo = "abc".into(); // invalid: band left as it was
+        e.notch = "".into(); // cleared
+        e.extra = "".into();
+        e.y = "10, 1".into(); // lo >= hi: ignored
+        e.apply(&mut s);
+        assert_eq!(s.extra["band"], json!([200.0, null]));
+        assert!(s.extra.get("notch").is_none() && s.extra.get("order").is_none() && s.ylim.is_none());
+    }
+
+    #[test]
+    fn preset_json_shape() {
+        let p = Preset { time_base: Some(30.0), channels: vec![spec(), Spec::new("CH1", "slow")], overview: None };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["channels"][0]["ref"], "CH6");
+        assert_eq!(v["channels"][0]["band"], json!([100.0, 3000.0]));
+        assert!(v["channels"][1].get("ref").is_none());
+        let back: Preset = serde_json::from_value(v).unwrap();
+        assert_eq!(back.channels, p.channels);
     }
 }

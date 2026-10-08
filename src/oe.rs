@@ -112,8 +112,9 @@ impl Recording {
 
     /// Rows [i0, i1) clipped to the recording: (first row, number of rows).
     pub fn clip(&self, i0: i64, i1: i64) -> (usize, usize) {
-        let a = i0.max(0) as usize;
-        let b = (i1.max(0) as usize).min(self.n_samples());
+        let n = self.n_samples();
+        let a = (i0.max(0) as usize).min(n);
+        let b = (i1.max(0) as usize).min(n);
         (a, b.saturating_sub(a))
     }
 

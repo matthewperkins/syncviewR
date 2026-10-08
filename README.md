@@ -10,9 +10,8 @@ whole-session overview](docs/screenshot-macos.png)
 
 MIT-licensed (see `LICENSE`). Written mostly by an AI model; see [Provenance](#provenance).
 
-**Status: first milestone (core viewer).** It reads the same recordings, presets and cache folder
-as the Python version. Not yet ported: the full channel editor (reference channel, band edges,
-notch and Y range editing; reordering; saving presets), the Video… button, and clip export.
+**Status:** the viewer and channel editor are ported. It reads the same recordings, presets and
+cache folder as the Python version. Not yet ported: clip export.
 
 ## Build
 
@@ -48,6 +47,14 @@ syncviewr --rec "/path/to/Record Node 101/experiment1/recording1" \
 Controls are as in syncview: scroll = zoom time; sideways swipe, Shift+scroll or drag = pan;
 ⌘/Ctrl+scroll = scale one row's Y, double-click = reset it; click/drag the overview strip to jump;
 ←/→ one video frame (Shift: 10 % of the view), PgUp/PgDn, Home/End, Space play, [ / ] speed, +/- zoom.
+
+**Channel table** (right): Show, Label, Ch, Ref (bipolar reference), Mode, Low/High Hz (blank =
+no filter edge), Notch (e.g. `60` or `60,180`), Extra (`order=3 smooth_ms=10 env_lp=40 plot_fs=1000
+win_s=30`), Y range (`auto` or `lo, hi`). Text fields apply on Enter or when you click away; input
+that doesn't parse reverts. Changing a row's mode resets its band and Extra settings to that mode's
+defaults (Python syncview keeps the old band). Click a row's number to select it for Up / Down /
+Remove and as the template for Add. **Load…/Save…** read and write presets in the Python format
+(time base, rows, overview); **Video…** attaches a video.
 
 **Sharing a cache with Python syncview.** Cache entries use the same keys and layout, so
 `--cache` pointed at a Python syncview cache folder reuses its filtered traces and video indexes
