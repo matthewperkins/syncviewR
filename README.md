@@ -5,6 +5,9 @@ side by side with a behaviour video, frame-locked to the camera trigger. Built w
 [egui](https://github.com/emilk/egui)/eframe for the interface, [wgpu](https://wgpu.rs) (Vulkan,
 Metal, DirectX) for drawing the traces, and FFmpeg (`ffmpeg-next`) for video.
 
+![syncviewR on macOS: video frame-locked to 16 channels of slow-wave and EMG traces, channel table, and
+whole-session overview](docs/screenshot-macos.png)
+
 MIT-licensed (see `LICENSE`). Written mostly by an AI model; see [Provenance](#provenance).
 
 **Status: first milestone (core viewer).** It reads the same recordings, presets and cache folder
@@ -69,9 +72,9 @@ three times, offset by one physical pixel, to get ~2 px lines.
 - **Video:** frames at 14 indexes (incl. both sides of keyframes and the last frame) are the same
   frames Python's decoder returns (mean grey difference 0.005 vs ≥ 0.33 between neighbours).
 - **GUI:** Linux (Hyprland/Wayland, Vulkan, NVIDIA T400), 1648×983, 16 rows + video playing at 1×:
-  58–60 frames/s (the display's refresh rate).
-- **Not yet checked:** macOS, Windows, mouse/trackpad/keyboard handling beyond basic use, multi-hour
-  recordings.
+  58–60 frames/s (the display's refresh rate). macOS (Apple silicon, Metal, Retina; Homebrew Rust,
+  FFmpeg and pkgconf): builds and runs with the 10-minute excerpt; trackpad and keys behave well.
+- **Not yet checked:** Windows, multi-hour recordings, detailed trackpad/keyboard feel.
 
 ## Provenance
 
