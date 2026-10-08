@@ -5,6 +5,7 @@ mod app;
 mod cache;
 mod demo;
 mod filters;
+mod folder;
 mod gpu;
 mod npy;
 mod oe;
@@ -26,8 +27,12 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(version, verbatim_doc_comment)]
 struct Cli {
+    /// a folder holding one Open Ephys recording, and optionally one video and one preset JSON
+    /// (e.g. a shared sample); they are found and opened together. --video / --preset override.
+    #[arg(value_name = "FOLDER", conflicts_with_all = ["rec", "demo"])]
+    folder: Option<PathBuf>,
     /// Open Ephys recording folder (…/experimentN/recordingM, containing structure.oebin)
-    #[arg(long, required_unless_present = "demo")]
+    #[arg(long, required_unless_present_any = ["demo", "folder"])]
     rec: Option<PathBuf>,
     /// try syncviewR on synthetic data: writes a 5-minute recording, a matching video and a preset
     /// (~100 MB) into DIR (default: the cache folder) on first use, then opens them
@@ -90,6 +95,22 @@ fn main() -> Result<()> {
         cli.video = cli.video.or(Some(d.video));
         cli.preset = cli.preset.or(Some(d.preset));
         cli.time = cli.time.or(Some(17.0)); // just before the first chewing bout
+    }
+    if let Some(dir) = &cli.folder {
+        let f = match folder::resolve(dir, cli.video.is_none(), cli.preset.is_none()) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("syncviewr: {e:#}");
+                std::process::exit(2);
+            }
+        };
+        let show = |p: &Option<PathBuf>| p.as_ref().map_or("none".into(), |p| p.display().to_string());
+        eprintln!("syncviewr: recording {}", f.rec.display());
+        eprintln!("syncviewr: video {}", show(&f.video));
+        eprintln!("syncviewr: preset {}", show(&f.preset));
+        cli.rec = Some(f.rec);
+        cli.video = cli.video.or(f.video);
+        cli.preset = cli.preset.or(f.preset);
     }
     let rec = match oe::Recording::open(cli.rec.as_ref().unwrap(), &cli.stream) {
         Ok(r) => Arc::new(r),

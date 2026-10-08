@@ -76,6 +76,16 @@ ordinary Open Ephys recording, so Python syncview opens it too (see its `README.
 ## Run
 
 ```bash
+syncviewr /path/to/folder           # finds the recording, video and preset inside it
+```
+
+Given a folder, syncviewR searches it for the one Open Ephys recording (a folder containing
+`structure.oebin`), the one video (`.mp4`, `.mov`, `.avi`, `.mkv`) and a preset JSON at its top
+level (if there are several, the one named `preset.json`). This suits a shared sample or a session
+folder: in Terminal, type `syncviewr ` and drag the folder in from Finder. If a folder holds several
+recordings or videos, syncviewR lists them and you pick with the options below:
+
+```bash
 syncviewr --rec "/path/to/Record Node 101/experiment1/recording1" \
           --video /path/to/BASLER_CAM_….mp4 \
           --preset presets.json          # optional; default: all electrode channels as EMG
@@ -83,7 +93,8 @@ syncviewr --rec "/path/to/Record Node 101/experiment1/recording1" \
 
 | option | default | |
 |---|---|---|
-| `--rec FOLDER` | (required unless `--demo`) | Open Ephys recording folder (contains `structure.oebin`) |
+| `FOLDER` | | a folder to search for the recording, video and preset (above) |
+| `--rec FOLDER` | (required unless FOLDER or `--demo`) | Open Ephys recording folder (contains `structure.oebin`) |
 | `--video FILE` | none | video recorded during this recording |
 | `--preset FILE.json` | built from the recording | same JSON as Python syncview |
 | `--stream NAME` | `acquisition_board` | Open Ephys continuous stream |
