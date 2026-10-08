@@ -158,6 +158,16 @@ pub fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
     Ok(())
 }
 
+pub fn write_i16(path: &Path, data: &[i16]) -> Result<()> {
+    let mut f = std::io::BufWriter::new(File::create(path)?);
+    f.write_all(&header_bytes("<i2", data.len()))?;
+    for v in data {
+        f.write_all(&v.to_le_bytes())?;
+    }
+    f.flush()?;
+    Ok(())
+}
+
 pub fn write_i64(path: &Path, data: &[i64]) -> Result<()> {
     let mut f = std::io::BufWriter::new(File::create(path)?);
     f.write_all(&header_bytes("<i8", data.len()))?;

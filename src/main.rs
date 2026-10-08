@@ -3,6 +3,7 @@
 
 mod app;
 mod cache;
+mod demo;
 mod filters;
 mod gpu;
 mod npy;
@@ -26,8 +27,12 @@ use std::sync::Arc;
 #[command(version, verbatim_doc_comment)]
 struct Cli {
     /// Open Ephys recording folder (…/experimentN/recordingM, containing structure.oebin)
-    #[arg(long)]
-    rec: PathBuf,
+    #[arg(long, required_unless_present = "demo")]
+    rec: Option<PathBuf>,
+    /// try syncviewR on synthetic data: writes a 5-minute recording, a matching video and a preset
+    /// (~100 MB) into DIR (default: the cache folder) on first use, then opens them
+    #[arg(long, value_name = "DIR", num_args = 0..=1, conflicts_with = "rec")]
+    demo: Option<Option<PathBuf>>,
     /// video recorded during this recording (one camera)
     #[arg(long)]
     video: Option<PathBuf>,
@@ -67,21 +72,28 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     ffmpeg_next::init().context("initialising FFmpeg")?;
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Error);
     if let (Some(d), Some(v)) = (&cli.dump_frames, &cli.video) {
         let idx: Vec<usize> = d[0].split(',').map(|s| s.parse()).collect::<Result<_, _>>()?;
         return video::dump_frames(v, &idx, std::path::Path::new(&d[1]));
     }
-    let rec = match oe::Recording::open(&cli.rec, &cli.stream) {
+    let root = cli.cache.clone().unwrap_or_else(cache::default_root);
+    if let Some(dir) = &cli.demo {
+        let d = demo::ensure(dir.as_ref().unwrap_or(&root))?;
+        cli.rec = Some(d.rec);
+        cli.video = cli.video.or(Some(d.video));
+        cli.preset = cli.preset.or(Some(d.preset));
+        cli.time = cli.time.or(Some(17.0)); // just before the first chewing bout
+    }
+    let rec = match oe::Recording::open(cli.rec.as_ref().unwrap(), &cli.stream) {
         Ok(r) => Arc::new(r),
         Err(e) => {
             eprintln!("syncviewr: cannot open recording: {e:#}");
             std::process::exit(2);
         }
     };
-    let root = cli.cache.clone().unwrap_or_else(cache::default_root);
     eprintln!("syncviewr: cache folder {}", root.display());
     let cache = Arc::new(cache::TraceCache::new(rec.clone(), root)?);
     let preset = match &cli.preset {

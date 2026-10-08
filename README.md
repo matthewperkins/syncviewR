@@ -42,6 +42,20 @@ whenever the system's FFmpeg changes major version): install FFmpeg's libraries 
 (`brew install ffmpeg pkgconf`, or `sudo pacman -S ffmpeg`) and leave out `--features static-ffmpeg`.
 From a checkout: `cargo build --release` gives `target/release/syncviewr`.
 
+## Try it without a rig
+
+```bash
+syncviewr --demo
+```
+
+This writes a synthetic five-minute recording, a matching cartoon video and a preset (~100 MB, about
+10 s, first run only) into the cache folder, then opens them. It contains a chewing jaw (masseter and
+digastric EMG, a jaw-position sensor and a bipolar masseter pair whose reference wire carries only
+hum and movement artefact), antral slow waves that grow after each meal, duodenal slow waves, and
+mains hum for the notch. Each video frame shows its frame number and its trigger's time, so the
+sync can be checked by eye. `syncviewr --demo DIR` writes it into DIR instead. The folder is an
+ordinary Open Ephys recording, so Python syncview opens it too (see its `README.txt`).
+
 ## Run
 
 ```bash
@@ -52,7 +66,7 @@ syncviewr --rec "/path/to/Record Node 101/experiment1/recording1" \
 
 | option | default | |
 |---|---|---|
-| `--rec FOLDER` | (required) | Open Ephys recording folder (contains `structure.oebin`) |
+| `--rec FOLDER` | (required unless `--demo`) | Open Ephys recording folder (contains `structure.oebin`) |
 | `--video FILE` | none | video recorded during this recording |
 | `--preset FILE.json` | built from the recording | same JSON as Python syncview |
 | `--stream NAME` | `acquisition_board` | Open Ephys continuous stream |
