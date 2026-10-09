@@ -87,7 +87,9 @@ can be a whole day's session, a Record Node or one recording. If it holds severa
 list opens: move with the Up and Down arrow keys and press Enter to open one. Each recording
 shows its length, channels, start time and camera triggers. If the folder holds several videos,
 a second list asks which one goes with the recording, or none. You can drop one video along with
-the folder, or before it; dropping several videos at once is refused. A preset JSON at the top of
+the folder, or before it (it's shown with a preview frame); dropping several videos at once is
+refused. If the video's frame count and the recording's camera triggers differ by more than 2, a
+warning says so before the viewer opens: open anyway, open without the video, or go back. A preset JSON at the top of
 the folder is used. While viewing, drop a video on the window to attach it, or drop another folder
 to go back to the start page with it.
 

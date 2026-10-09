@@ -52,6 +52,49 @@ pub struct Splash {
     demo: Option<(Receiver<Result<demo::Demo, String>>, Instant)>,
     icon: egui::TextureHandle,
     launch: Option<Launch>,
+    stream: Option<String>,
+    thumb: Option<Thumb>,
+    /// Frames and triggers disagree: the message, and what opens if the user goes ahead.
+    warning: Option<(String, Launch)>,
+}
+
+/// The waiting video's preview frame (decoded in the background) and a line about it.
+struct Thumb {
+    path: PathBuf,
+    detail: String,
+    rx: Option<Receiver<Result<video::Frame, String>>>,
+    tex: Option<egui::TextureHandle>,
+    error: Option<String>,
+}
+
+const THUMB: f32 = 150.0;
+const WARN_FILL: Color32 = Color32::from_rgb(0x3a, 0x22, 0x22);
+const WARN_TEXT: Color32 = Color32::from_rgb(0xf2, 0xb0, 0xa6);
+
+/// A warning when the video's frame count (estimated from the container) and the recording's
+/// camera triggers differ by more than 2 (one extra trigger at the end is normal).
+fn alignment_warning(rec: &Path, video_path: &Path, stream: Option<&str>, line: i64) -> Option<String> {
+    let frames = video::estimate_frames(video_path)?;
+    let r = openephys::Recording::open(rec).ok()?;
+    let c = match stream {
+        Some(s) => r.stream(s).ok()?,
+        None => r.stream("acquisition_board").or_else(|_| r.main_stream()).ok()?,
+    };
+    let l = u16::try_from(line).ok()?;
+    let triggers = r.ttl_for(c).map(|t| t.lines().get(&l).map_or(0, |e| e.rising)).max().unwrap_or(0);
+    let diff = triggers as i64 - frames as i64;
+    if diff.abs() <= 2 {
+        return None;
+    }
+    let name = video_path.file_name().unwrap_or_default().to_string_lossy();
+    let why = if triggers == 0 {
+        format!("The recording has no camera triggers on TTL line {l}, so the video can't be locked to the data. Is the camera trigger on another line (--trigger-line)?")
+    } else if diff < 0 {
+        format!("There are {} fewer triggers than frames. Video frame k is matched to trigger k, so this is probably not the video for this recording, or the triggers are on another line.", -diff)
+    } else {
+        format!("There are {diff} more triggers than frames. Video frame k is matched to trigger k, so frames missing from the video (or the wrong video) would shift everything after them.")
+    };
+    Some(format!("{name} has about {frames} frames, but the recording has {triggers} camera triggers on TTL line {l}.\n\n{why}"))
 }
 
 /// Milliseconds since 1970 as a local date and time (to the minute), like the session folder
@@ -118,7 +161,7 @@ fn describe_video(path: &Path) -> String {
 }
 
 impl Splash {
-    pub fn new(ctx: &egui::Context, cache_root: PathBuf, trigger_line: i64) -> Self {
+    pub fn new(ctx: &egui::Context, cache_root: PathBuf, trigger_line: i64, stream: Option<String>) -> Self {
         let icon = eframe::icon_data::from_png_bytes(crate::ICON_PNG).expect("built-in icon");
         let img = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
         let icon = ctx.load_texture("syncviewr-icon", img, egui::TextureOptions::LINEAR);
@@ -134,6 +177,9 @@ impl Splash {
             demo: None,
             icon,
             launch: None,
+            stream,
+            thumb: None,
+            warning: None,
         }
     }
 
@@ -218,8 +264,45 @@ impl Splash {
     }
 
     fn go(&mut self) {
-        if let Some(rec) = self.rec.clone() {
-            self.launch = Some(Launch { rec, video: self.video.clone(), preset: self.preset.clone(), time: None });
+        let Some(rec) = self.rec.clone() else { return };
+        let l = Launch { rec, video: self.video.clone(), preset: self.preset.clone(), time: None };
+        if let Some(v) = &l.video
+            && let Some(w) = alignment_warning(&l.rec, v, self.stream.as_deref(), self.trigger_line)
+        {
+            self.warning = Some((w, l));
+            return;
+        }
+        self.launch = Some(l);
+    }
+
+    /// Start or collect the preview of the waiting video.
+    fn update_thumb(&mut self, ctx: &egui::Context) {
+        let Some(v) = &self.video else {
+            self.thumb = None;
+            return;
+        };
+        if self.thumb.as_ref().is_none_or(|t| &t.path != v) {
+            let (tx, rx) = channel();
+            let (p, c) = (v.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(video::thumbnail(&p, (THUMB * 2.0) as u32).map_err(|e| format!("{e:#}")));
+                c.request_repaint();
+            });
+            let frames = video::estimate_frames(v).map(|n| format!("  ·  ~{n} frames")).unwrap_or_default();
+            self.thumb = Some(Thumb { path: v.clone(), detail: describe_video(v) + &frames, rx: Some(rx), tex: None, error: None });
+        }
+        let t = self.thumb.as_mut().unwrap();
+        if let Some(rx) = &t.rx
+            && let Ok(r) = rx.try_recv()
+        {
+            t.rx = None;
+            match r {
+                Ok(f) => {
+                    let img = egui::ColorImage::from_rgb([f.width, f.height], &f.rgb);
+                    t.tex = Some(ctx.load_texture("syncviewr-thumb", img, egui::TextureOptions::LINEAR));
+                }
+                Err(e) => t.error = Some(e),
+            }
         }
     }
 
@@ -279,6 +362,7 @@ impl Splash {
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Launch> {
         let ctx = ui.ctx().clone();
         self.poll_demo(&ctx);
+        self.update_thumb(&ctx);
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         egui::CentralPanel::no_frame().frame(egui::Frame::NONE.fill(BG)).show(ui, |ui| {
             let w = 620f32.min(ui.available_width() - 32.0);
@@ -316,14 +400,58 @@ impl Splash {
                 }
 
                 // what's waiting
-                if let Some(v) = self.video.clone() {
+                if let Some(t) = &self.thumb {
+                    ui.add_space(12.0);
+                    let name = t.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let mut clear = false;
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - w) / 2.0);
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(THUMB, THUMB), egui::Sense::hover());
+                        ui.painter().rect_filled(r, 6.0, Color32::BLACK);
+                        match (&t.tex, &t.error) {
+                            (Some(tex), _) => {
+                                let sz = tex.size_vec2();
+                                let k = (THUMB / sz.x).min(THUMB / sz.y);
+                                let img = egui::Rect::from_center_size(r.center(), sz * k);
+                                ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            }
+                            (None, Some(_)) => {
+                                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "no preview", egui::FontId::proportional(13.0), MUTED);
+                            }
+                            (None, None) => {
+                                ui.put(egui::Rect::from_center_size(r.center(), egui::vec2(24.0, 24.0)), egui::Spinner::new());
+                            }
+                        }
+                        ui.add_space(10.0);
+                        ui.vertical(|ui| {
+                            ui.add_space(THUMB / 2.0 - 26.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Video").color(MUTED));
+                                if ui.small_button("×").on_hover_text("Don't use this video").clicked() {
+                                    clear = true;
+                                }
+                            });
+                            ui.label(RichText::new(&name).color(LABEL));
+                            ui.label(RichText::new(&t.detail).color(MUTED).size(12.5));
+                        });
+                    });
+                    if clear {
+                        self.video = None;
+                    }
+                }
+                if let Some(r) = self.rec.clone() {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.add_space((ui.available_width() - w) / 2.0);
-                        ui.label(RichText::new("Video:").color(MUTED));
-                        ui.label(RichText::new(v.file_name().unwrap_or_default().to_string_lossy()).color(FG));
-                        if ui.small_button("✕").on_hover_text("Don't use this video").clicked() {
-                            self.video = None;
+                        ui.label(RichText::new("Recording").color(MUTED));
+                        let parts: Vec<String> = r.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+                        let short = parts[parts.len().saturating_sub(3)..].join("/");
+                        ui.label(RichText::new(short).color(FG).monospace()).on_hover_text(r.display().to_string());
+                        if ui.button("Open").clicked() {
+                            self.go();
+                        }
+                        if ui.small_button("×").on_hover_text("Don't use this recording").clicked() {
+                            self.rec = None;
                         }
                     });
                 }
@@ -355,7 +483,51 @@ impl Splash {
             });
         });
         self.picker_ui(&ctx);
+        self.warning_ui(&ctx);
         self.launch.take()
+    }
+
+    /// Frames and triggers disagree: open anyway, open without the video, or go back.
+    fn warning_ui(&mut self, ctx: &egui::Context) {
+        let Some((text, _)) = &self.warning else { return };
+        let text = text.clone();
+        let (mut open, mut without, mut back) = (false, false, false);
+        ctx.input_mut(|i| {
+            open = i.consume_key(egui::Modifiers::NONE, Key::Enter);
+            back = i.consume_key(egui::Modifiers::NONE, Key::Escape);
+        });
+        let frame = egui::Frame::popup(&ctx.global_style())
+            .fill(WARN_FILL)
+            .stroke(egui::Stroke::new(1.0, WARN_TEXT.gamma_multiply(0.6)))
+            .inner_margin(18.0);
+        let m = egui::Modal::new(egui::Id::new("syncviewr-sync-warning")).frame(frame).show(ctx, |ui| {
+            ui.set_width(560f32.min(ctx.content_rect().width() - 80.0));
+            ui.label(RichText::new("⚠  The video and the recording may not line up").size(17.0).color(WARN_TEXT));
+            ui.add_space(10.0);
+            ui.label(RichText::new(text).color(LABEL));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                open |= ui.button("Open anyway").clicked();
+                without |= ui.button("Open without the video").clicked();
+                back |= ui.button("Back").clicked();
+            });
+            ui.label(RichText::new("Enter: open anyway   Esc: back").color(MUTED).size(12.0));
+        });
+        if m.should_close() {
+            back = true;
+        }
+        if open || without {
+            let (_, mut l) = self.warning.take().unwrap();
+            if without {
+                l.video = None;
+                self.video = None;
+            }
+            self.launch = Some(l);
+        } else if back {
+            self.warning = None;
+            self.note("Drop another video for this recording, or press Open to view it without one.".into());
+            self.video = None;
+        }
     }
 
     fn picker_ui(&mut self, ctx: &egui::Context) {
@@ -497,7 +669,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         session(&dir);
         let ctx = egui::Context::default();
-        let mut s = Splash::new(&ctx, dir.clone(), 1);
+        let mut s = Splash::new(&ctx, dir.clone(), 1, None);
 
         s.take_paths(vec![dir.clone()]);
         assert!(frame(&ctx, &mut s, &[]).is_none());

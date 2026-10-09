@@ -75,6 +75,9 @@ struct Cli {
     screenshot: Option<PathBuf>,
     #[arg(long, hide = true, default_value_t = 5.0)]
     screenshot_after: f64,
+    /// (testing) start on the start page as if these files and folders had been dropped on it
+    #[arg(long, hide = true, num_args = 1..)]
+    drop: Vec<PathBuf>,
     /// (testing) build the cache for the preset's rows and overview, then exit
     #[arg(long, hide = true)]
     build_only: bool,
@@ -121,6 +124,9 @@ fn main() -> Result<()> {
         };
     } else if let Some(rec) = &cli.rec {
         start = shell::Start::Viewer(splash::Launch { rec: rec.clone(), video: cli.video.clone(), preset: cli.preset.clone(), time: cli.time });
+    }
+    if !cli.drop.is_empty() {
+        start = shell::Start::Splash(cli.drop.clone());
     }
     if cli.build_only {
         let shell::Start::Viewer(l) = &start else { anyhow::bail!("--build-only needs one recording") };

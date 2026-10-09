@@ -192,17 +192,20 @@ fn hex(s: &str) -> Color32 {
 
 pub fn fmt_time(t: f64, span: Option<f64>) -> String {
     let sign = if t < 0.0 { "-" } else { "" };
-    let t = t.abs();
-    let h = (t / 3600.0).floor();
-    let rem = t - h * 3600.0;
-    let m = (rem / 60.0).floor();
-    let s = rem - m * 60.0;
     let dec = match span {
         None => 3,
         Some(sp) if sp < 10.0 => 3,
         Some(sp) if sp < 300.0 => 1,
         _ => 0,
     };
+    // round first, so 59.98 s at 0 decimals carries into the minutes ("7:00", not "6:60")
+    let scale = 10f64.powi(dec);
+    let t = (t.abs() * scale).round() / scale;
+    let h = (t / 3600.0).floor();
+    let rem = t - h * 3600.0;
+    let m = (rem / 60.0).floor();
+    let s = rem - m * 60.0;
+    let dec = dec as usize;
     let width = if dec > 0 { 3 + dec } else { 2 };
     let sec = format!("{s:0width$.dec$}");
     if h > 0.0 { format!("{sign}{}:{:02}:{sec}", h as i64, m as i64) } else { format!("{sign}{}:{sec}", m as i64) }
@@ -1179,6 +1182,15 @@ mod tests {
     fn spec() -> Spec {
         serde_json::from_value(json!({"ch": "CH5", "ref": "CH6", "mode": "hilo", "label": "x",
             "band": [100.0, 3000.0], "notch": [60.0, 120.0], "order": 3, "ylim": [-50.0, 50.0]})).unwrap()
+    }
+
+    #[test]
+    fn times_round_into_the_next_minute() {
+        assert_eq!(fmt_time(419.98, Some(3600.0)), "7:00");
+        assert_eq!(fmt_time(119.96, Some(60.0)), "2:00.0");
+        assert_eq!(fmt_time(3599.9996, None), "1:00:00.000");
+        assert_eq!(fmt_time(61.3, Some(60.0)), "1:01.3");
+        assert_eq!(fmt_time(-5.0, None), "-0:05.000");
     }
 
     #[test]

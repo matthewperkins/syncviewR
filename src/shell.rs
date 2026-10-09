@@ -62,7 +62,7 @@ impl Shell {
         crate::gpu::init(cc.wgpu_render_state.as_ref().expect("syncviewr needs the wgpu renderer"));
         let ctx = &cc.egui_ctx;
         ctx.set_visuals(egui::Visuals::dark());
-        let splash = Splash::new(ctx, settings.cache_root.clone(), settings.trigger_line);
+        let splash = Splash::new(ctx, settings.cache_root.clone(), settings.trigger_line, settings.stream.clone());
         let mut shell = Self { settings, state: State::Splash(Box::new(splash)), screenshot, started: Instant::now(), shot_requested: false };
         match start {
             Start::Viewer(l) => shell.open(ctx, l),
@@ -83,7 +83,7 @@ impl Shell {
             }
             Err(e) => {
                 if !matches!(self.state, State::Splash(_)) {
-                    self.state = State::Splash(Box::new(Splash::new(ctx, self.settings.cache_root.clone(), self.settings.trigger_line)));
+                    self.state = State::Splash(Box::new(Splash::new(ctx, self.settings.cache_root.clone(), self.settings.trigger_line, self.settings.stream.clone())));
                 }
                 if let State::Splash(s) = &mut self.state {
                     s.error(format!("Couldn't open {}: {e:#}", l.rec.display()));
@@ -154,7 +154,7 @@ impl eframe::App for Shell {
                 }
                 let to_splash = dropped.len() > 1 || dropped.iter().any(|p| !crate::folder::is_video(p));
                 if to_splash {
-                    let mut s = Splash::new(&ctx, self.settings.cache_root.clone(), self.settings.trigger_line);
+                    let mut s = Splash::new(&ctx, self.settings.cache_root.clone(), self.settings.trigger_line, self.settings.stream.clone());
                     s.take_paths(dropped);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title("syncviewR".into()));
                     self.state = State::Splash(Box::new(s));

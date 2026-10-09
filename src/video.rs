@@ -342,3 +342,60 @@ pub fn dump_frames(path: &Path, indexes: &[usize], dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Frames in the video by the container's count, or duration × frame rate when it has none: an
+/// estimate, for a quick check before the exact (packet-counting) index is built.
+pub fn estimate_frames(path: &Path) -> Option<usize> {
+    let ictx = ff::format::input(&path).ok()?;
+    let s = ictx.streams().best(ff::media::Type::Video)?;
+    if s.frames() > 0 {
+        return Some(s.frames() as usize);
+    }
+    let r = s.avg_frame_rate();
+    let d = ictx.duration();
+    (r.1 > 0 && d > 0).then(|| (d as f64 / ff::ffi::AV_TIME_BASE as f64 * r.0 as f64 / r.1 as f64).round() as usize)
+}
+
+/// One frame from about a tenth of the way in, scaled to fit in `max` × `max` pixels.
+pub fn thumbnail(path: &Path, max: u32) -> Result<Frame> {
+    let mut ictx = ff::format::input(&path)?;
+    let stream = ictx.streams().best(ff::media::Type::Video).context("no video stream")?;
+    let si = stream.index();
+    let mut dec = ff::codec::context::Context::from_parameters(stream.parameters())?.decoder().video()?;
+    let d = ictx.duration();
+    if d > 0 {
+        let _ = ictx.seek(d / 10, ..d / 10 + 1);
+    }
+    let mut frame = ff::frame::Video::empty();
+    let mut got = false;
+    for (s, p) in ictx.packets() {
+        if s.index() != si {
+            continue;
+        }
+        let _ = dec.send_packet(&p);
+        if dec.receive_frame(&mut frame).is_ok() {
+            got = true;
+            break;
+        }
+    }
+    if !got {
+        let _ = dec.send_eof();
+        got = dec.receive_frame(&mut frame).is_ok();
+    }
+    if !got {
+        bail!("no frame could be decoded");
+    }
+    let (w, h) = (frame.width(), frame.height());
+    let k = (max as f64 / w as f64).min(max as f64 / h as f64).min(1.0);
+    let (tw, th) = (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1));
+    let mut sc = ff::software::scaling::Context::get(frame.format(), w, h, ff::format::Pixel::RGB24, tw, th, ff::software::scaling::Flags::AREA)?;
+    let mut rgb = ff::frame::Video::empty();
+    sc.run(&frame, &mut rgb)?;
+    let (tw, th) = (tw as usize, th as usize);
+    let stride = rgb.stride(0);
+    let mut packed = Vec::with_capacity(tw * th * 3);
+    for row in 0..th {
+        packed.extend_from_slice(&rgb.data(0)[row * stride..row * stride + 3 * tw]);
+    }
+    Ok(Frame { index: 0, width: tw, height: th, rgb: packed })
+}
