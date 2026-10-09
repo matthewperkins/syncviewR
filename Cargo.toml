@@ -13,6 +13,8 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+# only to switch on build-portable (below), which ffmpeg-next doesn't pass through
+ffmpeg-sys-next = { version = "9", default-features = false, optional = true }
 memmap2 = "0.9.11"
 num-complex = "0.4.6"
 rayon = "1.12.0"
@@ -30,8 +32,10 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 [features]
 # Compile FFmpeg from source into the binary (LGPL, no external codec libraries): no system FFmpeg
 # needed to build or run. Needs git, a C compiler and make (+ nasm on x86-64); the first build takes
-# several minutes longer.
-static-ffmpeg = ["ffmpeg-next/build"]
+# several minutes longer. build-portable: without it FFmpeg is compiled with -march=native, for the
+# build machine's CPU only (a binary built on a newer Mac could crash on an older one), and MSVC
+# rejects the flag.
+static-ffmpeg = ["ffmpeg-next/build", "dep:ffmpeg-sys-next", "ffmpeg-sys-next/build-portable"]
 
 [profile.release]
 strip = true

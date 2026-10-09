@@ -2650,6 +2650,7 @@ dependencies = [
  "clap",
  "eframe",
  "ffmpeg-next",
+ "ffmpeg-sys-next",
  "libc",
  "memmap2",
  "num-complex",
