@@ -1,6 +1,9 @@
 //! syncviewR: an Open Ephys + behaviour-video viewer in Rust (egui + wgpu), modelled on the Python
 //! syncview. Video frame k is locked to the k-th rising edge of the camera trigger line.
 
+// Windows: no console window when started by double-click; see attach_console.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod cache;
 mod demo;
@@ -90,7 +93,20 @@ struct Cli {
 /// `rsvg-convert -w 512 -h 512`).
 pub(crate) const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
+/// Windows: a GUI-subsystem program has no console, so when started from a terminal, write
+/// messages (and --help) to the terminal it was started from.
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: plain Win32 call; failure (no parent console) is harmless.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_console();
     let cli = Cli::parse();
     ffmpeg_next::init().context("initialising FFmpeg")?;
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Error);
