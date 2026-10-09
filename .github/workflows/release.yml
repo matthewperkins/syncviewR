@@ -60,9 +60,13 @@ jobs:
         shell: pwsh
         run: |
           $msys = "${{ steps.msys2.outputs.msys2-location }}\usr\bin"
-          # MSYS2's coreutils `link` would shadow MSVC's link.exe
+          # MSYS2's coreutils `link` would shadow MSVC's link.exe (which msvc-dev-cmd put first)
           Remove-Item "$msys\link.exe" -ErrorAction SilentlyContinue
-          $env:PATH = "$env:PATH;$msys"
+          # MSYS2's sh, make and awk ahead of Git for Windows' and MinGW's, which break FFmpeg's
+          # dependency rules; MSVC's cl and link still come first
+          $msvc = ($env:PATH -split ';' | Where-Object { $_ -match 'Microsoft Visual Studio|Windows Kits' }) -join ';'
+          $env:PATH = "$msvc;$msys;$env:PATH"
+          where.exe sh make awk cl link
           $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
           cargo build --release --features static-ffmpeg
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
