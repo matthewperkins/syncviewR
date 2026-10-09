@@ -9,7 +9,6 @@ name: Release binaries
 on:
   push:
     tags: ["v*"]
-    branches: [ci] # TEMPORARY: test runs from the ci branch; remove before merging
   workflow_dispatch:
 
 permissions:
