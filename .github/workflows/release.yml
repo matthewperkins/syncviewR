@@ -88,6 +88,33 @@ jobs:
           [ "$RUNNER_OS" = Windows ] && exe=$exe.exe
           "$exe" --demo "$RUNNER_TEMP/demo" --cache "$RUNNER_TEMP/cache" --build-only
 
+      # ---- Windows GUI check: open the start page, and the viewer on the demo, and save
+      # screenshots (the runner draws with Windows' software renderer)
+      - name: Screenshots (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target\release\syncviewr.exe).Path
+          $out = New-Item -ItemType Directory -Force -Path windows-screenshots
+          function Shot($name, $argline) {
+            $p = Start-Process -FilePath $exe -ArgumentList $argline -PassThru `
+              -RedirectStandardError "$out\$name.stderr.txt" -RedirectStandardOutput "$out\$name.stdout.txt"
+            if (-not $p.WaitForExit(120000)) { $p.Kill(); "$name: timed out" }
+            "$name: exit code $($p.ExitCode)"
+            if (Test-Path "$out\$name.ppm") { magick "$out\$name.ppm" "$out\$name.png"; Remove-Item "$out\$name.ppm" }
+            Get-Content "$out\$name.stderr.txt" -ErrorAction SilentlyContinue
+          }
+          Shot "start-page" "--screenshot `"$out\start-page.ppm`" --screenshot-after 6"
+          Shot "viewer-demo" "--demo `"$env:RUNNER_TEMP\demo`" --cache `"$env:RUNNER_TEMP\cache`" --screenshot `"$out\viewer-demo.ppm`" --screenshot-after 12"
+          Get-ChildItem $out
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows'
+        with:
+          name: windows-screenshots
+          path: windows-screenshots
+          if-no-files-found: warn
+
       - name: Package
         shell: bash
         run: |
