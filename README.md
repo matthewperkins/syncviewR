@@ -34,7 +34,16 @@ To run it from any folder, move it onto your PATH: `sudo mv syncviewr /usr/local
 not signed with an Apple Developer ID. A file downloaded with `curl` isn't marked as quarantined,
 so macOS runs it straight away. If you download the zip with a browser instead, clear the flag once
 with `xattr -d com.apple.quarantine syncviewr`, or use System Settings → Privacy & Security →
-Open Anyway. Other platforms, and Intel Macs, build from source as below.
+Open Anyway.
+
+**Prebuilt (Windows, x64).** Download `syncviewr-windows-x64.zip` from the
+[latest release](https://github.com/matthewperkins/syncviewR/releases/latest), unzip it and
+double-click `syncviewr.exe`, or run it from PowerShell (`.\syncviewr.exe --demo`). The build is
+not code-signed, so the first time Windows shows "Windows protected your PC": click *More info* →
+*Run anyway*. Linux and Intel Macs build from source as below.
+
+Both prebuilt binaries are built by GitHub Actions from the tagged commit
+(`.github/workflows/release.yml`).
 
 **From source.** You need Rust (1.89 or newer) and a C compiler. The `static-ffmpeg` option compiles FFmpeg into
 syncviewR, so nothing else is needed and the program keeps working when system packages change.
