@@ -317,17 +317,21 @@ fn sosfilt_zi(sos: &Sos) -> Vec<[f64; 2]> {
         .collect()
 }
 
-fn sosfilt_inplace(sos: &Sos, x: &mut [f64], zi: &[[f64; 2]], x0: f64) {
-    for (s, z) in sos.iter().zip(zi) {
-        let (b0, b1, b2, a1, a2) = (s[0], s[1], s[2], s[4], s[5]);
-        let (mut z0, mut z1) = (z[0] * x0, z[1] * x0);
-        for v in x.iter_mut() {
-            let xi = *v;
-            let y = b0 * xi + z0;
-            z0 = b1 * xi - a1 * y + z1;
-            z1 = b2 * xi - a2 * y;
-            *v = y;
+/// Filter the samples `x` yields, in that order, through all sections, with initial state zi * x0.
+/// All sections are applied to each sample in turn (rather than each section to the whole array),
+/// so a long trace passes through memory once; the arithmetic per sample is the same.
+fn sosfilt_inplace<'a>(sos: &Sos, x: impl Iterator<Item = &'a mut f64>, zi: &[[f64; 2]], x0: f64) {
+    let mut z: Vec<[f64; 2]> = zi.iter().map(|z| [z[0] * x0, z[1] * x0]).collect();
+    for v in x {
+        let mut xi = *v;
+        for (s, z) in sos.iter().zip(z.iter_mut()) {
+            let (b0, b1, b2, a1, a2) = (s[0], s[1], s[2], s[4], s[5]);
+            let y = b0 * xi + z[0];
+            z[0] = b1 * xi - a1 * y + z[1];
+            z[1] = b2 * xi - a2 * y;
+            xi = y;
         }
+        *v = xi;
     }
 }
 
@@ -349,12 +353,12 @@ pub fn sosfiltfilt(sos: &Sos, x: &[f64]) -> Vec<f64> {
     ext.extend((0..edge).map(|i| 2.0 * x[n - 1] - x[n - 2 - i]));
     let zi = sosfilt_zi(sos);
     let x0 = ext[0];
-    sosfilt_inplace(sos, &mut ext, &zi, x0);
-    ext.reverse();
-    let y0 = ext[0];
-    sosfilt_inplace(sos, &mut ext, &zi, y0);
-    ext.reverse();
-    ext[edge..edge + n].to_vec()
+    sosfilt_inplace(sos, ext.iter_mut(), &zi, x0);
+    let y0 = ext[ext.len() - 1];
+    sosfilt_inplace(sos, ext.iter_mut().rev(), &zi, y0);
+    ext.truncate(edge + n);
+    ext.drain(..edge);
+    ext
 }
 
 fn filt(x: Vec<f64>, fs: f64, lo: Option<f64>, hi: Option<f64>, order: usize) -> Vec<f64> {

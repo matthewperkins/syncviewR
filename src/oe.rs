@@ -102,6 +102,46 @@ impl Recording {
         (a, b.saturating_sub(a))
     }
 
+    /// Stored values of several channels for rows [first, first + n), one column per channel, in
+    /// one pass over the rows (reading channels one at a time reads every row once per channel).
+    pub fn raw_columns(&self, chans: &[usize], first: usize, n: usize) -> Vec<Vec<i16>> {
+        use rayon::prelude::*;
+        let c = self.cont();
+        let nc = c.n_channels();
+        // split the rows between threads; each fills its own piece of every column
+        let part = n.div_ceil(rayon::current_num_threads().max(1)).max(65_536);
+        let pieces: Vec<Vec<Vec<i16>>> = (first..first + n)
+            .step_by(part)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|a| {
+                let b = (a + part).min(first + n);
+                let mut out: Vec<Vec<i16>> = chans.iter().map(|_| Vec::with_capacity(b - a)).collect();
+                for blk in c.blocks(a..b) {
+                    for row in blk.chunks_exact(nc) {
+                        for (col, &ch) in out.iter_mut().zip(chans) {
+                            col.push(row[ch]);
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        (0..chans.len())
+            .map(|k| {
+                let mut col = Vec::with_capacity(n);
+                for p in &pieces {
+                    col.extend_from_slice(&p[k]);
+                }
+                col
+            })
+            .collect()
+    }
+
+    pub fn bit_volts(&self, ch: usize) -> f64 {
+        self.cont().bit_volts(ch)
+    }
+
     /// Physical-unit trace of `ch` (minus `reference`) for rows [first, first + n).
     pub fn trace(&self, ch: usize, reference: Option<usize>, first: usize, n: usize) -> Vec<f64> {
         match reference {

@@ -183,9 +183,6 @@ impl F32MapMut {
     pub fn as_slice(&self) -> &[f32] {
         bytemuck::cast_slice(&self.map[self.offset..self.offset + 4 * self.len])
     }
-    pub fn flush(&self) -> Result<()> {
-        Ok(self.map.flush()?)
-    }
 }
 
 pub fn create_f32_mmap(path: &Path, len: usize) -> Result<F32MapMut> {

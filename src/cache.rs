@@ -215,6 +215,21 @@ impl TraceCache {
                 std::fs::create_dir_all(d)?;
                 maps.push(npy::create_f32_mmap(&d.join("level0.npy"), n.div_ceil(*st))?);
             }
+            // the channels the specs need, each read once per chunk
+            let mut chans: Vec<usize> = vec![];
+            let mut wanted: Vec<(usize, Option<usize>)> = vec![];
+            for s in &specs {
+                let ch = rec.ch(&s.ch).with_context(|| format!("unknown channel {}", s.ch))?;
+                let r = s.reference.as_deref().filter(|r| !r.is_empty()).and_then(|r| rec.ch(r));
+                for c in std::iter::once(ch).chain(r) {
+                    if !chans.contains(&c) {
+                        chans.push(c);
+                    }
+                }
+                let col = |c: usize| chans.iter().position(|x| *x == c).unwrap();
+                wanted.push((col(ch), r.map(col)));
+            }
+            let bv: Vec<f64> = chans.iter().map(|c| rec.bit_volts(*c)).collect();
             let mut c0 = 0;
             while c0 < n {
                 if cancel() {
@@ -222,11 +237,14 @@ impl TraceCache {
                 }
                 let c1 = (c0 + chunk).min(n);
                 let (first, len) = rec.clip(c0 as i64 - pad, c1 as i64 + pad);
-                maps.par_iter_mut().zip(&specs).zip(&steps).try_for_each(|((map, s), &st)| -> Result<()> {
+                let cols = rec.raw_columns(&chans, first, len);
+                maps.par_iter_mut().zip(&specs).zip(&steps).zip(&wanted).try_for_each(|(((map, s), &st), &(a, r))| -> Result<()> {
                     let out = map.as_mut_slice();
-                    let ch = rec.ch(&s.ch).context("unknown channel")?;
-                    let r = s.reference.as_deref().filter(|r| !r.is_empty()).and_then(|r| rec.ch(r));
-                    let x = rec.trace(ch, r, first, len);
+                    // same arithmetic as Recording::trace, so cached values don't change
+                    let x: Vec<f64> = match r {
+                        None => cols[a].iter().map(|v| *v as f64 * bv[a]).collect(),
+                        Some(b) => cols[a].iter().zip(&cols[b]).map(|(u, w)| *u as f64 * bv[a] - *w as f64 * bv[b]).collect(),
+                    };
                     let (y, a, st2) = process(x, first as i64, fs, s)?;
                     debug_assert_eq!(st2 as usize, st);
                     let k0 = ((c0 as i64 - a) / st as i64).max(0) as usize;
@@ -239,14 +257,16 @@ impl TraceCache {
                     }
                     Ok(())
                 })?;
+                drop(cols);
                 progress(c1 as f64 / n as f64);
                 c0 = c1;
             }
-            for (((s, st), d), map) in specs.iter().zip(&steps).zip(&tmp).zip(&maps) {
-                if cancel() {
-                    return Ok(false);
-                }
-                map.flush()?;
+            // finish each trace (zoom pyramid, stats, metadata, move into place) in parallel; the
+            // mapped level0 files need no flush, as readers map the same pages
+            if cancel() {
+                return Ok(false);
+            }
+            specs.par_iter().zip(&steps).zip(&tmp).zip(&maps).try_for_each(|(((s, st), d), map)| -> Result<()> {
                 let y = map.as_slice();
                 let levels = build_pyramid(y, d)?;
                 let mut spec_json = serde_json::to_value(s.processing())?;
@@ -259,7 +279,8 @@ impl TraceCache {
                 let fin = self.root.join(self.key(s));
                 let _ = std::fs::remove_dir_all(&fin);
                 std::fs::rename(d, &fin)?;
-            }
+                Ok(())
+            })?;
             Ok(true)
         })();
         if !matches!(result, Ok(true)) {
