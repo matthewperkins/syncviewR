@@ -86,6 +86,10 @@ jobs:
           exe=target/release/syncviewr
           [ "$RUNNER_OS" = Windows ] && exe=$exe.exe
           "$exe" --demo "$RUNNER_TEMP/demo" --cache "$RUNNER_TEMP/cache" --build-only
+          # and a 2-second clip through this platform's encoder
+          mkdir -p clip-test
+          "$exe" --demo "$RUNNER_TEMP/demo" --cache "$RUNNER_TEMP/cache" --export-clip clip-test/demo-clip-$RUNNER_OS.mp4 --clip-from 20 --clip-to 22
+          ls -l clip-test
 
       # ---- Windows GUI check: open the start page, and the viewer on the demo, and save
       # screenshots (the runner draws with Windows' software renderer)
@@ -112,6 +116,12 @@ jobs:
         with:
           name: windows-screenshots
           path: windows-screenshots
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clip-test-${{ runner.os }}
+          path: clip-test
           if-no-files-found: warn
 
       - name: Package

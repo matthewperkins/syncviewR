@@ -8,9 +8,11 @@ authors = ["Matthew Perkins"]
 
 [dependencies]
 anyhow = "1.0.104"
+ab_glyph = "0.2"
 openephys = { git = "https://github.com/matthewperkins/openephys-rs" }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
+epaint_default_fonts = "0.36"
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
 # only to switch on build-portable (below), which ffmpeg-next doesn't pass through
@@ -22,6 +24,7 @@ rfd = "0.17"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1_smol = "1.0.1"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -34,8 +37,8 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 # needed to build or run. Needs git, a C compiler and make (+ nasm on x86-64); the first build takes
 # several minutes longer. build-portable: without it FFmpeg is compiled with -march=native, for the
 # build machine's CPU only (a binary built on a newer Mac could crash on an older one), and MSVC
-# rejects the flag.
-static-ffmpeg = ["ffmpeg-next/build", "dep:ffmpeg-sys-next", "ffmpeg-sys-next/build-portable"]
+# rejects the flag. build-videotoolbox: Apple's hardware H.264 encoder (macOS only) for clip export.
+static-ffmpeg = ["ffmpeg-next/build", "dep:ffmpeg-sys-next", "ffmpeg-sys-next/build-portable", "ffmpeg-sys-next/build-videotoolbox"]
 
 [profile.release]
 strip = true

@@ -16,7 +16,6 @@ use std::time::Instant;
 const RATES: [f64; 10] = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 100.0, 300.0];
 const TIME_BASES: [f64; 16] = [0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0, 7200.0];
 const WINDOW_MAX_S: f64 = 180.0; // on-demand (uncached) processing only for views up to this span
-const PALETTE: [&str; 6] = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"];
 pub const BG: Color32 = Color32::from_rgb(0x11, 0x11, 0x11);
 pub const FG: Color32 = Color32::from_rgb(0xc3, 0xc2, 0xb7);
 pub const LABEL: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xe4);
@@ -168,6 +167,8 @@ pub struct App {
     trigger_line: i64,
     frames: Vec<f64>,
     frame_period: f64,
+    frame_rows: Vec<i64>, // recording row of each frame's trigger
+    export: Export,
     video: Option<VideoDecoder>,
     video_ready: bool,
     video_tex: Option<egui::TextureHandle>,
@@ -291,6 +292,8 @@ impl App {
             trigger_line: opts.trigger_line,
             frames,
             frame_period: 0.02,
+            frame_rows: vec![],
+            export: Export::default(),
             video: None,
             video_ready: false,
             video_tex: None,
@@ -356,6 +359,8 @@ impl App {
         }
         self.overview_key = self.overview.as_ref().map(|o| self.cache.key(o));
         let old: std::collections::HashMap<String, Option<(f64, f64)>> = self.rows.iter().map(|r| (r.key.clone(), r.auto)).collect();
+        let shown: Vec<&Spec> = self.specs.iter().filter(|s| s.show).collect();
+        let colors = crate::clip::row_colors(&shown);
         self.rows = self
             .specs
             .iter()
@@ -365,7 +370,7 @@ impl App {
             .map(|(i, (ti, s))| {
                 let key = self.cache.key(s);
                 Row {
-                    color: s.color.as_deref().map(hex).unwrap_or_else(|| hex(PALETTE[i % PALETTE.len()])),
+                    color: hex(&colors[i]),
                     auto: old.get(&key).copied().flatten(),
                     key,
                     spec: s.clone(),
@@ -461,6 +466,7 @@ impl App {
                             self.dialogs.push(("Video sync warning".into(), format!("{name} on TTL line {}:\n\n{body}", self.trigger_line)));
                         }
                         self.frames = si.frames.iter().map(|i| *i as f64 / self.rec.fs).collect();
+                        self.frame_rows = si.frames.clone();
                         self.frame_period = si.period;
                         self.status = format!(
                             "{name}: {} frames {}×{}, {} extra trigger(s) dropped; video spans {} – {}; decoding on CPU (FFmpeg)",
@@ -695,6 +701,15 @@ impl App {
             if ui.button("Video…").on_hover_text("attach the video recorded during this session").clicked() {
                 let ctx = ui.ctx().clone();
                 self.choose_video_dialog(&ctx);
+            }
+            let can_export = self.video_ready && self.video.is_some();
+            if ui
+                .add_enabled(can_export, egui::Button::new("Export clip…"))
+                .on_hover_text("save the video with the traces scrolling underneath as an MP4")
+                .on_disabled_hover_text("attach a video first")
+                .clicked()
+            {
+                self.open_export();
             }
             ui.separator();
             let fr = self.current_frame().map(|k| format!("   frame {k}")).unwrap_or_default();
@@ -1122,7 +1137,211 @@ impl App {
     }
 }
 
+/// The "Export clip" dialog and a running export.
+#[derive(Default)]
+struct Export {
+    open: bool,
+    from: String,
+    to: String,
+    time_base: String,
+    width: String,
+    speed: String,
+    msg: Option<(String, bool)>,
+    run: Option<ExportRun>,
+}
+
+struct ExportRun {
+    progress: Arc<std::sync::Mutex<f64>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    rx: std::sync::mpsc::Receiver<Result<(PathBuf, crate::clip::ClipDone), String>>,
+    started: Instant,
+}
+
+/// Seconds, or m:ss / h:mm:ss.
+fn parse_clock(s: &str) -> Option<f64> {
+    let parts: Option<Vec<f64>> = s.trim().split(':').map(|p| p.trim().parse().ok()).collect();
+    let parts = parts?;
+    Some(parts.iter().rev().enumerate().map(|(i, v)| v * 60f64.powi(i as i32)).sum())
+}
+
 impl App {
+    fn open_export(&mut self) {
+        let e = &mut self.export;
+        if e.run.is_none() {
+            let (a, b) = (self.t - self.span / 2.0, self.t + self.span / 2.0);
+            let first = self.frames.first().copied().unwrap_or(0.0);
+            let last = self.frames.last().copied().unwrap_or(self.rec.duration());
+            e.from = fmt_time(a.max(first), None);
+            e.to = fmt_time(b.min(last), None);
+            if e.time_base.is_empty() {
+                e.time_base = g3(self.span.min(10.0));
+            }
+            if e.speed.is_empty() {
+                e.speed = "1".into();
+            }
+            e.msg = None;
+        }
+        e.open = true;
+    }
+
+    fn export_ui(&mut self, ctx: &egui::Context) {
+        // a running export: progress, or its result
+        if let Some(run) = &self.export.run {
+            match run.rx.try_recv() {
+                Ok(Ok((path, d))) => {
+                    let secs = run.started.elapsed().as_secs_f64();
+                    self.export.msg = Some((
+                        format!(
+                            "Wrote {} ({} frames, {}×{}, {:.3} frames/s, {}) in {:.0} s.",
+                            path.display(), d.frames, d.size.0, d.size.1, d.fps, d.codec, secs
+                        ),
+                        false,
+                    ));
+                    self.status = format!("exported {}", path.display());
+                    self.export.run = None;
+                }
+                Ok(Err(e)) => {
+                    self.export.msg = Some((e, true));
+                    self.export.run = None;
+                }
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        }
+        if !self.export.open {
+            return;
+        }
+        let mut open = true;
+        let mut start = false;
+        egui::Window::new("Export clip").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            let running = self.export.run.is_some();
+            ui.add_enabled_ui(!running, |ui| {
+                egui::Grid::new("export-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    let e = &mut self.export;
+                    ui.label("From");
+                    ui.add(egui::TextEdit::singleline(&mut e.from).desired_width(110.0).hint_text("h:mm:ss"));
+                    ui.end_row();
+                    ui.label("To");
+                    ui.add(egui::TextEdit::singleline(&mut e.to).desired_width(110.0).hint_text("h:mm:ss"));
+                    ui.end_row();
+                    ui.label("Time base (s)").on_hover_text("seconds of data across the chart: half before, half after each frame");
+                    ui.add(egui::TextEdit::singleline(&mut e.time_base).desired_width(110.0));
+                    ui.end_row();
+                    ui.label("Width (px)").on_hover_text("blank: the video's own width");
+                    ui.add(egui::TextEdit::singleline(&mut e.width).desired_width(110.0).hint_text("video's"));
+                    ui.end_row();
+                    ui.label("Speed (×)").on_hover_text("1 = real time; 0.25 = four times slower");
+                    ui.add(egui::TextEdit::singleline(&mut e.speed).desired_width(110.0));
+                    ui.end_row();
+                });
+                if ui.small_button("Use the current view").clicked() {
+                    let (a, b) = (self.t - self.span / 2.0, self.t + self.span / 2.0);
+                    self.export.from = fmt_time(a.max(self.frames.first().copied().unwrap_or(0.0)), None);
+                    self.export.to = fmt_time(b.min(self.frames.last().copied().unwrap_or(b)), None);
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "The {} rows shown, with their colours and Y ranges, under the video.",
+                        self.rows.len()
+                    ))
+                    .color(MUTED)
+                    .size(12.0),
+                );
+            });
+            ui.add_space(6.0);
+            if let Some(run) = &self.export.run {
+                let f = *run.progress.lock().unwrap();
+                ui.add(egui::ProgressBar::new(f as f32).desired_width(320.0).text(format!("exporting… {:.0}%", f * 100.0)));
+                if ui.button("Cancel").clicked() {
+                    run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if ui.button("Export…").clicked() {
+                start = true;
+            }
+            if let Some((m, err)) = &self.export.msg {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(m).color(if *err { Color32::from_rgb(0xe0, 0x70, 0x60) } else { FG }));
+            }
+        });
+        self.export.open = open || self.export.run.is_some();
+        if start
+            && let Err(e) = self.start_export(ctx)
+        {
+            self.export.msg = Some((e, true));
+        }
+    }
+
+    fn start_export(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let e = &self.export;
+        let from = parse_clock(&e.from).ok_or("From isn't a time (seconds or h:mm:ss)")?;
+        let to = parse_clock(&e.to).ok_or("To isn't a time (seconds or h:mm:ss)")?;
+        let time_base: f64 = e.time_base.trim().parse().map_err(|_| "Time base isn't a number")?;
+        let speed: f64 = e.speed.trim().trim_end_matches(['x', '×']).parse().map_err(|_| "Speed isn't a number")?;
+        let width: Option<u32> = if e.width.trim().is_empty() { None } else { Some(e.width.trim().parse().map_err(|_| "Width isn't a whole number")?) };
+        if to <= from {
+            return Err("To must be after From".into());
+        }
+        if speed <= 0.0 || time_base <= 0.0 {
+            return Err("Speed and time base must be positive".into());
+        }
+        let video = self.video.as_ref().map(|v| v.path.clone()).ok_or("no video")?;
+        let stem = video.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let name = format!("{stem}_{}-{}.mp4", fmt_time(from, Some(1e9)).replace(':', "-"), fmt_time(to, Some(1e9)).replace(':', "-"));
+        let mut d = rfd::FileDialog::new().set_title("Save clip").add_filter("MP4 video", &["mp4"]).set_file_name(&name);
+        if let Some(dir) = video.parent() {
+            d = d.set_directory(dir);
+        }
+        let Some(mut out) = d.save_file() else { return Ok(()) };
+        if out.extension().is_none() {
+            out.set_extension("mp4");
+        }
+        // the rows as shown: their colours and current Y ranges
+        let mut rows = vec![];
+        for i in 0..self.rows.len() {
+            let tr = self.trace_for(&self.rows[i]);
+            let (lo, hi) = self.row_ylim(i, tr.as_deref());
+            let r = &self.rows[i];
+            let unit = self.rec.ch(&r.spec.ch).map(|c| self.rec.units[c].replace("uV", "µV")).unwrap_or_default();
+            rows.push(crate::clip::ClipRow {
+                spec: r.spec.clone(),
+                label: r.spec.label.clone().unwrap_or_else(|| r.spec.ch.clone()),
+                unit,
+                color: [r.color.r(), r.color.g(), r.color.b()],
+                ylim: Some((lo, hi)),
+            });
+        }
+        let job = crate::clip::ClipJob { out: out.clone(), video, from, to, time_base, width, speed, rows };
+        let (rec, cache) = (self.rec.clone(), self.cache.clone());
+        let (frames, period) = (self.frame_rows.clone(), self.frame_period);
+        let index_dir = self.cache.root.join("video_index");
+        let progress = Arc::new(std::sync::Mutex::new(0.0));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (p2, c2, ctx2) = (progress.clone(), cancel.clone(), ctx.clone());
+        std::thread::Builder::new()
+            .name("clip-export".into())
+            .spawn(move || {
+                let r = crate::clip::render(
+                    &job,
+                    &rec,
+                    &cache,
+                    &frames,
+                    period,
+                    &index_dir,
+                    &|f| {
+                        *p2.lock().unwrap() = f;
+                        ctx2.request_repaint();
+                    },
+                    &|| c2.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                let _ = tx.send(r.map(|d| (out, d)).map_err(|e| format!("Export failed: {e:#}")));
+                ctx2.request_repaint();
+            })
+            .map_err(|e| e.to_string())?;
+        self.export.run = Some(ExportRun { progress, cancel, rx, started: Instant::now() });
+        self.export.msg = None;
+        Ok(())
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if let Some((last, times)) = &mut self.fps {
@@ -1168,6 +1387,11 @@ impl App {
             self.traces_ui(ui);
         });
         self.dialogs_ui(&ctx);
+        // (testing: SYNCVIEWR_TEST_EXPORT=1 opens the export dialog once the video is synced)
+        if self.video_ready && !self.export.open && self.export.from.is_empty() && std::env::var_os("SYNCVIEWR_TEST_EXPORT").is_some() {
+            self.open_export();
+        }
+        self.export_ui(&ctx);
         if self.playing {
             ctx.request_repaint();
         }

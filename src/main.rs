@@ -6,6 +6,7 @@
 
 mod app;
 mod cache;
+mod clip;
 mod demo;
 mod filters;
 mod folder;
@@ -78,6 +79,25 @@ struct Cli {
     screenshot: Option<PathBuf>,
     #[arg(long, hide = true, default_value_t = 5.0)]
     screenshot_after: f64,
+    /// export a clip (video + scrolling traces, as MP4) instead of opening the window; needs a
+    /// recording and a video (FOLDER, --rec/--video or --demo) and --clip-from / --clip-to
+    #[arg(long, value_name = "OUT.mp4")]
+    export_clip: Option<PathBuf>,
+    /// clip start: seconds since the recording started, or m:ss / h:mm:ss
+    #[arg(long, value_parser = parse_time, requires = "export_clip")]
+    clip_from: Option<f64>,
+    /// clip end (same form as --clip-from)
+    #[arg(long, value_parser = parse_time, requires = "export_clip")]
+    clip_to: Option<f64>,
+    /// seconds of data across the clip's chart (half past, half future)
+    #[arg(long, default_value_t = 4.0)]
+    clip_time_base: f64,
+    /// clip width in pixels (default: the video's)
+    #[arg(long)]
+    clip_width: Option<u32>,
+    /// playback speed: 1 = real time, 0.25 = four times slower
+    #[arg(long, default_value_t = 1.0)]
+    clip_speed: f64,
     /// (testing) start on the start page as if these files and folders had been dropped on it
     #[arg(long, hide = true, num_args = 1..)]
     drop: Vec<PathBuf>,
@@ -91,6 +111,15 @@ struct Cli {
 
 /// Window, Dock and ⌘-Tab icon (assets/icon.svg, made by assets/make_icon.py; rendered with
 /// `rsvg-convert -w 512 -h 512`).
+fn parse_time(s: &str) -> Result<f64, String> {
+    let mut t = 0.0;
+    for part in s.split(':') {
+        let v: f64 = part.trim().parse().map_err(|_| format!("{s:?} is not a time (90, 1:30, 1:02:03)"))?;
+        t = t * 60.0 + v;
+    }
+    Ok(t)
+}
+
 pub(crate) const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 /// Windows: a GUI-subsystem program has no console, so when started from a terminal, write
@@ -143,6 +172,57 @@ fn main() -> Result<()> {
     }
     if !cli.drop.is_empty() {
         start = shell::Start::Splash(cli.drop.clone());
+    }
+    if let Some(out) = &cli.export_clip {
+        let shell::Start::Viewer(l) = &start else { anyhow::bail!("--export-clip needs one recording (FOLDER, --rec or --demo)") };
+        let video = l.video.clone().context("--export-clip needs a video (--video, or one in FOLDER)")?;
+        let (from, to) = match (cli.clip_from, cli.clip_to) {
+            (Some(a), Some(b)) => (a, b),
+            _ => anyhow::bail!("--export-clip needs --clip-from and --clip-to"),
+        };
+        let rec = Arc::new(oe::Recording::open(&l.rec, cli.stream.as_deref())?);
+        let cache = cache::TraceCache::new(rec.clone(), root.clone())?;
+        let (p, _) = preset::check(shell::load_preset(&l.preset, &rec)?, &rec);
+        let shown: Vec<&preset::Spec> = p.channels.iter().filter(|s| s.show).collect();
+        let colors = clip::row_colors(&shown);
+        let rows = shown
+            .iter()
+            .zip(&colors)
+            .map(|(s, c)| clip::ClipRow {
+                spec: (*s).clone(),
+                label: s.label.clone().unwrap_or_else(|| s.ch.clone()),
+                unit: rec.ch(&s.ch).map(|i| rec.units[i].replace("uV", "µV")).unwrap_or_default(),
+                color: clip::parse_hex(c),
+                ylim: s.ylim.map(|[a, b]| (a, b)),
+            })
+            .collect();
+        let index_dir = root.join("video_index");
+        let n = video::frame_pts(&video, &index_dir)?.len();
+        let sync = oe::check_sync(&rec, n, cli.trigger_line, video::video_duration(&video)).map_err(|e| anyhow::anyhow!(e))?;
+        for i in &sync.issues {
+            eprintln!("syncviewr: warning: {i}");
+        }
+        let job = clip::ClipJob { out: out.clone(), video, from, to, time_base: cli.clip_time_base, width: cli.clip_width, speed: cli.clip_speed, rows };
+        let t0 = std::time::Instant::now();
+        let last = std::sync::atomic::AtomicI64::new(-1);
+        let progress = |f: f64| {
+            let pct = (f * 100.0) as i64;
+            if last.swap(pct, std::sync::atomic::Ordering::Relaxed) != pct {
+                eprint!("\rexporting {pct}%");
+            }
+        };
+        let done = clip::render(&job, &rec, &cache, &sync.frames, sync.period, &index_dir, &progress, &|| false)?;
+        eprintln!(
+            "\nsyncviewr: wrote {} ({} frames, {}x{} at {:.3} frames/s, {}) in {:.1} s",
+            out.display(),
+            done.frames,
+            done.size.0,
+            done.size.1,
+            done.fps,
+            done.codec,
+            t0.elapsed().as_secs_f64()
+        );
+        return Ok(());
     }
     if cli.build_only {
         let shell::Start::Viewer(l) = &start else { anyhow::bail!("--build-only needs one recording") };

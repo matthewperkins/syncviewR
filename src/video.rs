@@ -80,6 +80,8 @@ struct Decoder {
     want: usize,
     pending: VecDeque<ff::frame::Video>,
     eof: bool,
+    /// Scale decoded frames to this size (default: as decoded).
+    out_size: Option<(u32, u32)>,
 }
 
 impl Decoder {
@@ -93,7 +95,7 @@ impl Decoder {
         if pts.is_empty() {
             bail!("no timestamped video packets found");
         }
-        let mut d = Decoder { ictx, si, dec, scaler: None, pts, want: 0, pending: VecDeque::new(), eof: false };
+        let mut d = Decoder { ictx, si, dec, scaler: None, pts, want: 0, pending: VecDeque::new(), eof: false, out_size: None };
         d.seek_to_index(0)?;
         Ok(d)
     }
@@ -162,15 +164,18 @@ impl Decoder {
 
     fn to_rgb(&mut self, f: &ff::frame::Video, index: usize) -> Result<Frame> {
         let (w, h) = (f.width(), f.height());
-        let ok = self.scaler.as_ref().is_some_and(|s| s.input().width == w && s.input().height == h && s.input().format == f.format());
+        let (ow, oh) = self.out_size.unwrap_or((w, h));
+        let ok = self.scaler.as_ref().is_some_and(|s| {
+            s.input().width == w && s.input().height == h && s.input().format == f.format() && s.output().width == ow && s.output().height == oh
+        });
         if !ok {
             self.scaler = Some(ff::software::scaling::Context::get(
-                f.format(), w, h, ff::format::Pixel::RGB24, w, h, ff::software::scaling::Flags::BILINEAR,
+                f.format(), w, h, ff::format::Pixel::RGB24, ow, oh, ff::software::scaling::Flags::BILINEAR,
             )?);
         }
         let mut rgb = ff::frame::Video::empty();
         self.scaler.as_mut().unwrap().run(f, &mut rgb)?;
-        let (w, h) = (w as usize, h as usize);
+        let (w, h) = (ow as usize, oh as usize);
         let stride = rgb.stride(0);
         let data = rgb.data(0);
         let mut packed = Vec::with_capacity(w * h * 3);
@@ -319,6 +324,43 @@ impl Drop for VideoDecoder {
         let (m, cv) = &*self.shared;
         m.lock().unwrap().stop = true;
         cv.notify_all();
+    }
+}
+
+/// Frames `first`, `first + 1`, … in order, scaled to `w` × `h` (for rendering clips).
+pub struct FrameReader {
+    dec: Decoder,
+}
+
+impl FrameReader {
+    pub fn open(path: &Path, index_dir: &Path, first: usize, w: u32, h: u32) -> Result<Self> {
+        let pts = frame_pts(path, index_dir)?;
+        if first >= pts.len() {
+            bail!("frame {first} is past the end of the video ({} frames)", pts.len());
+        }
+        let gop = keyframe_interval(path).unwrap_or(1);
+        let mut dec = Decoder::open(path, pts)?;
+        dec.out_size = Some((w, h));
+        let start = first - first % gop;
+        dec.seek_to_index(start)?;
+        // decode up to just before `first`; next() then returns frame `first`
+        if first > start {
+            dec.next_frames(first - start)?;
+        }
+        Ok(Self { dec })
+    }
+
+    /// The video's native size.
+    pub fn native_size(path: &Path) -> Result<(u32, u32)> {
+        let ictx = ff::format::input(&path)?;
+        let s = ictx.streams().best(ff::media::Type::Video).context("no video stream")?;
+        let ctx = ff::codec::context::Context::from_parameters(s.parameters())?;
+        let v = ctx.decoder().video()?;
+        Ok((v.width(), v.height()))
+    }
+
+    pub fn next(&mut self) -> Result<Frame> {
+        self.dec.next_frames(1)?.pop().context("the video ended early")
     }
 }
 

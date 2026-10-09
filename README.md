@@ -16,8 +16,8 @@ the current view).*
 
 MIT-licensed (see `LICENSE`). Written mostly by an AI model; see [Provenance](#provenance).
 
-**Status:** the viewer and channel editor are ported. It reads the same recordings, presets and
-cache folder as the Python version. Not yet ported: clip export.
+**Status:** everything in the Python version is ported: the viewer, the channel editor and clip
+export. It reads the same recordings and presets (and NWB recordings too).
 
 ## Install
 
@@ -138,9 +138,39 @@ defaults (Python syncview keeps the old band). Click a row's number to select it
 Remove and as the template for Add. **Load…/Save…** read and write presets in the Python format
 (time base, rows, overview); **Video…** attaches a video.
 
+**Rows of one muscle share a colour.** Rows named alike apart from a trailing number
+(masseter1 … masseter4, antrum 1 … antrum 4) get the same colour; a preset's own `color` wins.
+
 **Sharing a cache with Python syncview.** Cache entries use the same keys and layout, so
 `--cache` pointed at a Python syncview cache folder reuses its filtered traces and video indexes
-(and vice versa).
+(and vice versa). Slow-mode traces are the exception: syncviewR decimates before filtering them,
+so it keeps its own.
+
+## Export a clip
+
+**Export clip…** (in the toolbar, once a video is synced) saves an MP4 like Python syncview's
+clips: the video on top with a `t = … s   frame N` clock, and the rows shown underneath, with
+their colours and Y ranges, scrolling past a fixed cursor at each frame's trigger.
+
+| field | |
+|---|---|
+| From, To | the stretch of the recording (h:mm:ss or seconds); *Use the current view* fills them in |
+| Time base | seconds of data across the chart, half before and half after each frame |
+| Width | output width in pixels (blank: the video's own); the height follows |
+| Speed | 1 = real time, 0.25 = four times slower (the frame rate is the camera's × speed) |
+
+Export runs in the background, with progress and Cancel. From the command line, for batches:
+
+```bash
+syncviewr /path/to/folder --export-clip chewing.mp4 --clip-from 1:45 --clip-to 1:55 \
+          [--clip-time-base 4] [--clip-width 1280] [--clip-speed 0.25]
+```
+
+This uses the preset's shown rows (Y ranges from the preset, or automatic). Clips are H.264 where
+syncviewR's FFmpeg can encode it (macOS: Apple's VideoToolbox; builds against a system FFmpeg with
+x264), otherwise FFmpeg's own MPEG-4 (Part 2) encoder at high quality (the prebuilt Windows binary). VLC
+plays both; most other players and PowerPoint support MPEG-4 Part 2 too, but H.264 is the safer
+choice for slides.
 
 ## How it draws
 
