@@ -9,14 +9,14 @@
 //! frame is drawn from the same model at its trigger's time and prints its frame number and that
 //! time, so the sync can be checked by eye.
 
-use crate::npy;
 use anyhow::{Context, Result};
 use ffmpeg_next as ff;
 use rayon::prelude::*;
 use serde_json::json;
 use std::f64::consts::TAU;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use openephys::oebin::{ChannelInfo, ContinuousInfo, EventInfo};
+use openephys::RecordingWriter;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Bump when the generated data changes, so old demo folders are not reused.
@@ -194,13 +194,9 @@ fn trigger_rows() -> Vec<i64> {
 }
 
 fn write_recording(m: &Model, rec: &Path) -> Result<()> {
-    let cont = rec.join("continuous").join(STREAM_FOLDER);
-    let ttl = rec.join("events").join(STREAM_FOLDER).join("TTL");
-    fs::create_dir_all(&cont)?;
-    fs::create_dir_all(&ttl)?;
     let n = (DURATION_S * FS) as usize;
     let mut rng = Rng(0x5eed_cafe_f00d_1234, None);
-    let mut out = BufWriter::with_capacity(1 << 20, File::create(cont.join("continuous.dat"))?);
+    let mut data: Vec<i16> = Vec::with_capacity(n * CHANNELS.len());
     let to_i16 = |v: f64, bv: f64| (v / bv).round().clamp(-32768.0, 32767.0) as i16;
     for i in 0..n {
         let t = i as f64 / FS;
@@ -222,15 +218,39 @@ fn write_recording(m: &Model, rec: &Path) -> Result<()> {
         uv[7] = hum + noise();
         uv[0] += (6.0 + 260.0 * jaw.masseter) * rng.normal();
         uv[2] += (4.0 + 180.0 * jaw.digastric) * rng.normal();
-        let mut row = [0i16; 9];
-        for k in 0..8 {
-            row[k] = to_i16(uv[k], CH_UV);
-        }
-        row[8] = to_i16(0.2 + 2.5 * jaw.open + 0.004 * rng.normal(), ADC_V);
-        out.write_all(bytemuck::cast_slice(&row))?;
+        data.extend(uv.iter().map(|v| to_i16(*v, CH_UV)));
+        data.push(to_i16(0.2 + 2.5 * jaw.open + 0.004 * rng.normal(), ADC_V));
     }
-    out.flush()?;
-    npy::write_i64(&cont.join("sample_numbers.npy"), &(0..n as i64).map(|i| FIRST_SAMPLE + i).collect::<Vec<_>>())?;
+    let channels = CHANNELS
+        .iter()
+        .map(|name| {
+            let adc = name.starts_with("ADC");
+            ChannelInfo {
+                channel_name: name.to_string(),
+                description: if adc { "ADC input channel (synthetic)" } else { "Headstage channel (synthetic)" }.into(),
+                identifier: if adc { "acq-board.rhythm.continuous.adc" } else { "acq-board.rhythm.continuous.ephys" }.into(),
+                history: "syncviewr --demo".into(),
+                bit_volts: if adc { ADC_V } else { CH_UV },
+                units: if adc { "V" } else { "uV" }.into(),
+                type_code: Some(if adc { 2 } else { 0 }),
+                ..Default::default()
+            }
+        })
+        .collect();
+    let info = ContinuousInfo {
+        folder_name: format!("{STREAM_FOLDER}/"),
+        sample_rate: FS,
+        source_processor_name: "Acquisition Board".into(),
+        source_processor_id: Some(100),
+        stream_name: Some("acquisition_board".into()),
+        recorded_processor: Some("Record Node".into()),
+        recorded_processor_id: Some(101),
+        num_channels: CHANNELS.len(),
+        channels,
+        ..Default::default()
+    };
+    let mut w = RecordingWriter::create(rec, "0.6.7")?;
+    w.add_continuous(info, &data, &(0..n as i64).map(|i| FIRST_SAMPLE + i).collect::<Vec<_>>(), None)?;
 
     // TTL events: line 1 = camera (3 ms pulses), line 2 = a pulse at each bout start.
     let mut ev: Vec<(i64, i16)> = vec![];
@@ -242,48 +262,22 @@ fn write_recording(m: &Model, rec: &Path) -> Result<()> {
         ev.extend([(r, 2), (r + 1000, -2)]);
     }
     ev.sort();
-    npy::write_i64(&ttl.join("sample_numbers.npy"), &ev.iter().map(|e| FIRST_SAMPLE + e.0).collect::<Vec<_>>())?;
-    npy::write_i16(&ttl.join("states.npy"), &ev.iter().map(|e| e.1).collect::<Vec<_>>())?;
-
-    let channel = |name: &str| {
-        let adc = name.starts_with("ADC");
-        json!({
-            "channel_name": name,
-            "description": if adc { "ADC input channel (synthetic)" } else { "Headstage channel (synthetic)" },
-            "identifier": if adc { "acq-board.rhythm.continuous.adc" } else { "acq-board.rhythm.continuous.ephys" },
-            "history": "syncviewr --demo",
-            "bit_volts": if adc { ADC_V } else { CH_UV },
-            "units": if adc { "V" } else { "uV" },
-            "type": if adc { 2 } else { 0 },
-        })
+    let ttl = EventInfo {
+        folder_name: format!("{STREAM_FOLDER}/TTL/"),
+        channel_name: "Acquisition Board TTL Input".into(),
+        description: "Events on digital input lines (synthetic)".into(),
+        identifier: "acq-board.rhythm.events".into(),
+        sample_rate: FS,
+        data_type: "int16".into(),
+        source_processor: "Acquisition Board".into(),
+        stream_name: Some("acquisition_board".into()),
+        initial_state: Some(0),
+        ..Default::default()
     };
-    let meta = json!({
-        "GUI version": "0.6.7",
-        "continuous": [{
-            "folder_name": format!("{STREAM_FOLDER}/"),
-            "sample_rate": FS,
-            "source_processor_name": "Acquisition Board",
-            "source_processor_id": 100,
-            "stream_name": "acquisition_board",
-            "recorded_processor": "Record Node",
-            "recorded_processor_id": 101,
-            "num_channels": CHANNELS.len(),
-            "channels": CHANNELS.iter().map(|c| channel(c)).collect::<Vec<_>>(),
-        }],
-        "events": [{
-            "folder_name": format!("{STREAM_FOLDER}/TTL/"),
-            "channel_name": "Acquisition Board TTL Input",
-            "description": "Events on digital input lines (synthetic)",
-            "identifier": "acq-board.rhythm.events",
-            "sample_rate": FS,
-            "type": "int16",
-            "source_processor": "Acquisition Board",
-            "stream_name": "acquisition_board",
-            "initial_state": 0,
-        }],
-        "spikes": [],
-    });
-    fs::write(rec.join("structure.oebin"), serde_json::to_string_pretty(&meta)?)?;
+    let states: Vec<i16> = ev.iter().map(|e| e.1).collect();
+    let sample_numbers: Vec<i64> = ev.iter().map(|e| FIRST_SAMPLE + e.0).collect();
+    w.add_ttl(ttl, &states, &sample_numbers, None, None)?;
+    w.finish()?;
     Ok(())
 }
 

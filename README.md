@@ -36,7 +36,7 @@ so macOS runs it straight away. If you download the zip with a browser instead, 
 with `xattr -d com.apple.quarantine syncviewr`, or use System Settings → Privacy & Security →
 Open Anyway. Other platforms, and Intel Macs, build from source as below.
 
-**From source.** You need Rust (1.85 or newer) and a C compiler. The `static-ffmpeg` option compiles FFmpeg into
+**From source.** You need Rust (1.89 or newer) and a C compiler. The `static-ffmpeg` option compiles FFmpeg into
 syncviewR, so nothing else is needed and the program keeps working when system packages change.
 
 ```bash

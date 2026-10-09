@@ -38,18 +38,19 @@ fn list(paths: &[PathBuf], root: &Path) -> String {
     paths.iter().map(|p| format!("\n  {}", p.strip_prefix(root).unwrap_or(p).display())).collect()
 }
 
-/// The one Open Ephys recording (a folder with structure.oebin) under `dir`, the one video, and the
-/// one preset JSON at the top of `dir`. Several candidates are an error naming them, except
-/// presets, where `preset.json` wins. `want_video` / `want_preset` false skip those searches.
+/// The one Open Ephys recording (a folder with structure.oebin, or an experiment's .nwb file)
+/// under `dir`, the one video, and the one preset JSON at the top of `dir`. Several candidates are
+/// an error naming them, except presets, where `preset.json` wins. `want_video` / `want_preset`
+/// false skip those searches.
 pub fn resolve(dir: &Path, want_video: bool, want_preset: bool) -> Result<Found> {
     if !dir.is_dir() {
         bail!("{} is not a folder", dir.display());
     }
     let mut all = vec![dir.to_path_buf()];
     walk(dir, 6, &mut all);
-    let recs: Vec<PathBuf> = all.iter().filter(|p| p.join("structure.oebin").is_file()).cloned().collect();
+    let recs = openephys::find_recordings(dir, 6);
     let rec = match recs.as_slice() {
-        [] => bail!("no Open Ephys recording (a folder containing structure.oebin) in {}", dir.display()),
+        [] => bail!("no Open Ephys recording (a folder containing structure.oebin, or an NWB file) in {}", dir.display()),
         [r] => r.clone(),
         _ => bail!(
             "{} holds several recordings; pick one with --rec:{}",

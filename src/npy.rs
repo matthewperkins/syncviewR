@@ -45,6 +45,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header> {
 }
 
 /// Any integer or float 1-D array, converted to f64 / i64.
+#[cfg(test)]
 pub fn read_f64(path: &Path) -> Result<Vec<f64>> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let h = parse_header(&bytes)?;
@@ -154,16 +155,6 @@ pub fn write_f32(path: &Path, data: &[f32]) -> Result<()> {
     let mut f = std::io::BufWriter::new(File::create(path)?);
     f.write_all(&header_bytes("<f4", data.len()))?;
     f.write_all(bytemuck::cast_slice(data))?;
-    f.flush()?;
-    Ok(())
-}
-
-pub fn write_i16(path: &Path, data: &[i16]) -> Result<()> {
-    let mut f = std::io::BufWriter::new(File::create(path)?);
-    f.write_all(&header_bytes("<i2", data.len()))?;
-    for v in data {
-        f.write_all(&v.to_le_bytes())?;
-    }
     f.flush()?;
     Ok(())
 }

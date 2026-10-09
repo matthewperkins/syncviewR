@@ -8,6 +8,7 @@ authors = ["Matthew Perkins"]
 
 [dependencies]
 anyhow = "1.0.104"
+openephys = { git = "https://github.com/matthewperkins/openephys-rs" }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
