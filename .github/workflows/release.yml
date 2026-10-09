@@ -100,8 +100,8 @@ jobs:
           function Shot($name, $argline) {
             $p = Start-Process -FilePath $exe -ArgumentList $argline -PassThru `
               -RedirectStandardError "$out\$name.stderr.txt" -RedirectStandardOutput "$out\$name.stdout.txt"
-            if (-not $p.WaitForExit(120000)) { $p.Kill(); "$name: timed out" }
-            "$name: exit code $($p.ExitCode)"
+            if (-not $p.WaitForExit(120000)) { $p.Kill(); "${name}: timed out" }
+            "${name}: exit code $($p.ExitCode)"
             if (Test-Path "$out\$name.ppm") { magick "$out\$name.ppm" "$out\$name.png"; Remove-Item "$out\$name.ppm" }
             Get-Content "$out\$name.stderr.txt" -ErrorAction SilentlyContinue
           }
