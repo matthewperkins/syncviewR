@@ -84,6 +84,10 @@ pub fn spec_key(spec: &Spec, rec_dir: &str) -> String {
     d.insert("ch".into(), Value::String(spec.ch.clone()));
     d.insert("ref".into(), spec.reference.clone().filter(|r| !r.is_empty()).map_or(Value::Null, Value::String));
     d.insert("mode".into(), Value::String(spec.mode.clone()));
+    if spec.mode == "slow" {
+        // decimate-first slow mode (2026-10): its traces differ slightly from the full-rate ones
+        d.insert("algo".into(), Value::from(2));
+    }
     let text = py_json(&Value::Object(d));
     sha1_smol::Sha1::from(text.as_bytes()).digest().to_string()[..16].to_string()
 }
@@ -391,6 +395,92 @@ pub fn uniform_filter1d(x: &[f64], size: usize) -> Vec<f64> {
     (0..n as usize).map(|i| (cum[i + size] - cum[i]) / size as f64).collect()
 }
 
+/// Zeroth-order modified Bessel function of the first kind (for the Kaiser window).
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term, mut k) = (1.0, 1.0, 1.0);
+    while term > 1e-17 * sum {
+        term *= (x / (2.0 * k)).powi(2);
+        sum += term;
+        k += 1.0;
+    }
+    sum
+}
+
+/// Low-pass FIR for decimating by `d` (Kaiser-windowed sinc, linear phase, unity gain at DC):
+/// passes [0, fp] and attenuates by ~80 dB everything that would alias into [0, fp] at the new
+/// rate (from fs/d - fp up). None if fp is too close to the new Nyquist for that.
+pub fn decimation_fir(fs: f64, d: usize, fp: f64) -> Option<Vec<f64>> {
+    let fstop = fs / d as f64 - fp;
+    if d < 2 || fp.is_nan() || fp <= 0.0 || fstop < 1.25 * fp {
+        return None;
+    }
+    const ATTEN: f64 = 80.0;
+    let beta = 0.1102 * (ATTEN - 8.7);
+    let tw = (fstop - fp) / fs; // transition width, cycles per sample
+    let n = (((ATTEN - 7.95) / (14.36 * tw)).ceil() as usize + 1) | 1; // odd: integer delay
+    let fc = (fp + fstop) / 2.0 / fs;
+    let m = (n - 1) as f64 / 2.0;
+    let i0b = bessel_i0(beta);
+    let mut h: Vec<f64> = (0..n)
+        .map(|i| {
+            let t = i as f64 - m;
+            let sinc = if t == 0.0 { 2.0 * fc } else { (2.0 * PI * fc * t).sin() / (PI * t) };
+            sinc * bessel_i0(beta * (1.0 - (t / m).powi(2)).max(0.0).sqrt()) / i0b
+        })
+        .collect();
+    let sum: f64 = h.iter().sum();
+    h.iter_mut().for_each(|v| *v /= sum);
+    Some(h)
+}
+
+/// Filter x (first sample at absolute row a) with the centred FIR h, keeping only the samples on
+/// the global grid of `d` rows, like decimate(y, a, 1, d) of the filtered trace: zero phase, and
+/// only the kept samples are computed. The ends are extended by odd reflection (as sosfiltfilt).
+fn fir_decimate(x: &[f64], a: i64, d: usize, h: &[f64]) -> (Vec<f64>, i64) {
+    let n = x.len();
+    let k0 = (-a).rem_euclid(d as i64) as usize;
+    let m = h.len() / 2;
+    if n == 0 || k0 >= n {
+        return (vec![], a + k0 as i64);
+    }
+    let at = |k: i64| -> f64 {
+        let last = n as i64 - 1;
+        if k < 0 {
+            2.0 * x[0] - x[(-k).min(last) as usize]
+        } else if k > last {
+            2.0 * x[n - 1] - x[(2 * last - k).max(0) as usize]
+        } else {
+            x[k as usize]
+        }
+    };
+    let dot = |w: &[f64]| -> f64 {
+        // four running sums, so the compiler can vectorise
+        let mut acc = [0.0f64; 4];
+        let (wc, hc) = (w.chunks_exact(4), h.chunks_exact(4));
+        let (wr, hr) = (wc.remainder(), hc.remainder());
+        for (u, v) in wc.zip(hc) {
+            for j in 0..4 {
+                acc[j] += u[j] * v[j];
+            }
+        }
+        let tail: f64 = wr.iter().zip(hr).map(|(u, v)| u * v).sum();
+        (acc[0] + acc[1]) + (acc[2] + acc[3]) + tail
+    };
+    let mut out = Vec::with_capacity((n - k0).div_ceil(d));
+    let mut buf = vec![0.0; h.len()];
+    for p in (k0..n).step_by(d) {
+        if p >= m && p + m < n {
+            out.push(dot(&x[p - m..p + m + 1]));
+        } else {
+            for (j, b) in buf.iter_mut().enumerate() {
+                *b = at(p as i64 - m as i64 + j as i64);
+            }
+            out.push(dot(&buf));
+        }
+    }
+    (out, a + k0 as i64)
+}
+
 /// y sampled at absolute indices a + k*step: keep only samples on the global grid of step*factor.
 fn decimate(y: Vec<f64>, a: i64, step: i64, factor: i64) -> Result<(Vec<f64>, i64, i64)> {
     let new = step * factor;
@@ -409,11 +499,31 @@ pub fn process(x: Vec<f64>, a: i64, fs: f64, spec: &Spec) -> Result<(Vec<f64>, i
     let sub: Vec<f64> = x.iter().step_by((x.len() / 10000).max(1)).copied().collect();
     let med = crate::oe::median(&sub);
     let mut x: Vec<f64> = x.into_iter().map(|v| v - med).collect();
+    let (lo, hi) = p.band();
+    let order = p.order();
+    if spec.mode == "slow" {
+        // Decimate first, then filter at the plot rate: one FIR pass at the full rate instead of
+        // the notches and the low-pass there. The FIR keeps [0, max(hi, notches)] intact and
+        // blocks everything that would alias into it.
+        let d = out_step(spec, fs);
+        let fs1 = fs / d as f64;
+        let notches = p.notch();
+        let fp = notches.iter().copied().chain(hi).fold(0.0, f64::max);
+        let fits = hi.is_some_and(|h| h < 0.45 * fs1) && notches.iter().all(|f| *f < 0.45 * fs1);
+        if let Some(h) = decimation_fir(fs, d, fp).filter(|_| fits) {
+            let (mut y, a) = fir_decimate(&x, a, d, &h);
+            drop(x);
+            for f0 in notches {
+                y = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs1)], &y);
+            }
+            let y = filt(y, fs1, None, hi, order);
+            let y = filt(y, fs1, lo, None, order);
+            return Ok((y, a, d as i64));
+        }
+    }
     for f0 in p.notch() {
         x = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs)], &x);
     }
-    let (lo, hi) = p.band();
-    let order = p.order();
     match spec.mode.as_str() {
         "hilo" => Ok((filt(x, fs, lo, hi, order), a, 1)),
         "envelope" => {
@@ -425,6 +535,7 @@ pub fn process(x: Vec<f64>, a: i64, fs: f64, spec: &Spec) -> Result<(Vec<f64>, i
             decimate(y, a, 1, out_step(spec, fs) as i64)
         }
         "slow" => {
+            // (when decimating first doesn't fit, e.g. a notch near the plot rate's Nyquist)
             let y = filt(x, fs, None, hi, order); // low-pass at full rate
             let (y, a, step) = decimate(y, a, 1, out_step(spec, fs) as i64)?;
             let y = filt(y, fs / step as f64, lo, None, order); // high-pass at the plot rate
@@ -473,6 +584,22 @@ mod tests {
             let (y, a_out, step) = process(x.clone(), a, fs, &spec).unwrap();
             assert_eq!((a_out, step, y.len()), (case["a_out"].as_i64().unwrap(), case["step"].as_i64().unwrap(), want.len()), "{name}");
             let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            if spec.mode == "slow" {
+                // Decimated first, so not bit-for-bit: compare the slow-wave band (< 20 Hz) away
+                // from the ends, where the 0.03 Hz high-pass's edge transients differ.
+                let (i0, i1) = (y.len() / 4, 3 * y.len() / 4);
+                let fs1 = fs / step as f64;
+                let e: Vec<f64> = y.iter().zip(&want).map(|(p, q)| p - q).collect();
+                let e20 = filt(e.clone(), fs1, None, Some(20.0), 4);
+                let w20 = filt(want.clone(), fs1, None, Some(20.0), 4);
+                let rms = |v: &[f64]| (v.iter().map(|q| q * q).sum::<f64>() / v.len() as f64).sqrt();
+                let (band, sig) = (rms(&e20[i0..i1]), rms(&w20[i0..i1]));
+                let all = e[i0..i1].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                eprintln!("{name:14} below 20 Hz: rms |rust - python| = {band:.3e} (signal rms {sig:.3e}, relative {:.1e}); all frequencies max {:.1e} of signal max", band / sig, all / scale);
+                assert!(band <= 1e-3 * sig, "{name}: slow-wave band error {:.2e}", band / sig);
+                assert!(all <= 0.02 * scale, "{name}: error {:.2e} of signal max", all / scale);
+                continue;
+            }
             let err = y.iter().zip(&want).fold(0.0f64, |m, (p, q)| m.max((p - q).abs()));
             eprintln!("{name:14} max |rust - python| = {err:.3e}  (signal max {scale:.3e}, relative {:.1e})", err / scale);
             assert!(err <= 1e-7 * scale, "{name}: relative error {:.2e}", err / scale);
@@ -484,8 +611,34 @@ mod tests {
         let Some((c, _)) = fixtures() else { return };
         for k in c["keys"].as_array().unwrap() {
             let spec: Spec = serde_json::from_value(k["spec"].clone()).unwrap();
+            if spec.mode == "slow" {
+                continue; // slow-mode keys carry "algo" (decimate-first), so differ from Python's
+            }
             assert_eq!(spec_key(&spec, k["rec"].as_str().unwrap()), k["key"].as_str().unwrap(), "{}", k["spec"]);
         }
+    }
+
+    #[test]
+    fn decimation_fir_response() {
+        // 10 kHz -> 1 kHz, keeping 0-100 Hz: flat passband, ~80 dB down where aliases come from
+        let h = decimation_fir(10_000.0, 10, 100.0).unwrap();
+        let gain = |f: f64| {
+            let w = 2.0 * PI * f / 10_000.0;
+            let (re, im) = h.iter().enumerate().fold((0.0, 0.0), |(r, i), (k, v)| (r + v * (w * k as f64).cos(), i - v * (w * k as f64).sin()));
+            (re * re + im * im).sqrt()
+        };
+        for f in [0.0, 1.0, 10.0, 60.0, 100.0] {
+            assert!((gain(f) - 1.0).abs() < 1e-3, "passband gain at {f} Hz: {}", gain(f));
+        }
+        for f in [900.0, 1000.0, 1100.0, 1950.0, 3000.0, 4990.0] {
+            assert!(gain(f) < 2e-4, "stopband gain at {f} Hz: {}", gain(f));
+        }
+        assert!(decimation_fir(10_000.0, 10, 450.0).is_none(), "too close to the new Nyquist");
+        // kept samples sit on the global grid, like decimate()
+        let x: Vec<f64> = (0..1000).map(|i| (i as f64 * 0.01).sin()).collect();
+        let (y, a) = fir_decimate(&x, 7, 10, &h);
+        assert_eq!((a, y.len()), (10, 100));
+        assert!((y[50] - x[503]).abs() < 1e-3);
     }
 
     #[test]
@@ -496,3 +649,4 @@ mod tests {
         }
     }
 }
+
