@@ -61,7 +61,8 @@ impl Shell {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings, start: Start, screenshot: Option<(PathBuf, f64)>) -> Self {
         crate::gpu::init(cc.wgpu_render_state.as_ref().expect("syncviewr needs the wgpu renderer"));
         let ctx = &cc.egui_ctx;
-        ctx.set_visuals(egui::Visuals::dark());
+        // always dark, whatever the system theme (eframe would otherwise follow it)
+        ctx.set_theme(egui::ThemePreference::Dark);
         let splash = Splash::new(ctx, settings.cache_root.clone(), settings.trigger_line, settings.stream.clone());
         let mut shell = Self { settings, state: State::Splash(Box::new(splash)), screenshot, started: Instant::now(), shot_requested: false };
         match start {
