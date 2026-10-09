@@ -276,11 +276,15 @@ impl TraceCache {
                 let meta = json!({"spec": spec_json, "step": st, "dt": *st as f64 / fs, "n": y.len(), "levels": levels,
                                   "stats": stats(y), "built": format!("syncviewr {}", env!("CARGO_PKG_VERSION"))});
                 std::fs::write(d.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
-                let fin = self.root.join(self.key(s));
-                let _ = std::fs::remove_dir_all(&fin);
-                std::fs::rename(d, &fin)?;
                 Ok(())
             })?;
+            // unmap before moving into place: Windows won't rename a folder holding a mapped file
+            drop(maps);
+            for (s, d) in specs.iter().zip(&tmp) {
+                let fin = self.root.join(self.key(s));
+                let _ = std::fs::remove_dir_all(&fin);
+                std::fs::rename(d, &fin).with_context(|| format!("moving {} into place", d.display()))?;
+            }
             Ok(true)
         })();
         if !matches!(result, Ok(true)) {
