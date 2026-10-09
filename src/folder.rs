@@ -38,6 +38,34 @@ fn list(paths: &[PathBuf], root: &Path) -> String {
     paths.iter().map(|p| format!("\n  {}", p.strip_prefix(root).unwrap_or(p).display())).collect()
 }
 
+pub fn is_video(p: &Path) -> bool {
+    p.is_file() && p.extension().is_some_and(|e| VIDEO_EXT.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+/// Videos under `dir` (6 levels deep, hidden entries skipped), except inside the recordings `recs`.
+pub fn videos(dir: &Path, recs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut all = vec![];
+    walk(dir, 6, &mut all);
+    all.into_iter().filter(|p| is_video(p) && !recs.iter().any(|r| p.starts_with(r))).collect()
+}
+
+/// Preset JSON files at the top of `dir`.
+pub fn presets(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+    let mut v: Vec<PathBuf> =
+        rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "json") && is_preset(p)).collect();
+    v.sort();
+    v
+}
+
+/// The preset to use from `presets`: the only one, or the one named `preset.json`.
+pub fn pick_preset(presets: &[PathBuf]) -> Option<PathBuf> {
+    match presets {
+        [p] => Some(p.clone()),
+        _ => presets.iter().find(|p| p.file_name().is_some_and(|n| n == "preset.json")).cloned(),
+    }
+}
+
 /// The one Open Ephys recording (a folder with structure.oebin, or an experiment's .nwb file)
 /// under `dir`, the one video, and the one preset JSON at the top of `dir`. Several candidates are
 /// an error naming them, except presets, where `preset.json` wins. `want_video` / `want_preset`
@@ -46,29 +74,15 @@ pub fn resolve(dir: &Path, want_video: bool, want_preset: bool) -> Result<Found>
     if !dir.is_dir() {
         bail!("{} is not a folder", dir.display());
     }
-    let mut all = vec![dir.to_path_buf()];
-    walk(dir, 6, &mut all);
     let recs = openephys::find_recordings(dir, 6);
     let rec = match recs.as_slice() {
         [] => bail!("no Open Ephys recording (a folder containing structure.oebin, or an NWB file) in {}", dir.display()),
         [r] => r.clone(),
-        _ => bail!(
-            "{} holds several recordings; pick one with --rec:{}",
-            dir.display(),
-            list(&recs, dir)
-        ),
+        _ => bail!("{} holds several recordings; pick one with --rec:{}", dir.display(), list(&recs, dir)),
     };
     let mut found = Found { rec, ..Default::default() };
     if want_video {
-        let vids: Vec<PathBuf> = all
-            .iter()
-            .filter(|p| {
-                p.is_file()
-                    && !p.starts_with(&found.rec)
-                    && p.extension().is_some_and(|e| VIDEO_EXT.contains(&e.to_string_lossy().to_lowercase().as_str()))
-            })
-            .cloned()
-            .collect();
+        let vids = videos(dir, &recs);
         found.video = match vids.as_slice() {
             [] => None,
             [v] => Some(v.clone()),
@@ -76,23 +90,11 @@ pub fn resolve(dir: &Path, want_video: bool, want_preset: bool) -> Result<Found>
         };
     }
     if want_preset {
-        let mut presets: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "json") && is_preset(p))
-            .collect();
-        presets.sort();
-        found.preset = match presets.as_slice() {
-            [] => None,
-            [p] => Some(p.clone()),
-            _ => match presets.iter().find(|p| p.file_name().is_some_and(|n| n == "preset.json")) {
-                Some(p) => Some(p.clone()),
-                None => bail!(
-                    "{} holds several presets; pick one with --preset (or name it preset.json):{}",
-                    dir.display(),
-                    list(&presets, dir)
-                ),
-            },
-        };
+        let ps = presets(dir);
+        found.preset = pick_preset(&ps);
+        if found.preset.is_none() && ps.len() > 1 {
+            bail!("{} holds several presets; pick one with --preset (or name it preset.json):{}", dir.display(), list(&ps, dir));
+        }
     }
     Ok(found)
 }

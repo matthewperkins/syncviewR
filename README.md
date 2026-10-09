@@ -61,11 +61,13 @@ From a checkout: `cargo build --release` gives `target/release/syncviewr`.
 
 ## Try it without a rig
 
+Click **Try the demo** on the start page, or run
+
 ```bash
 syncviewr --demo
 ```
 
-This writes a synthetic five-minute recording, a matching cartoon video and a preset (~100 MB, about
+Either writes a synthetic five-minute recording, a matching cartoon video and a preset (~100 MB, about
 10 s, first run only) into the cache folder, then opens them. It contains a chewing jaw (masseter and
 digastric EMG, a jaw-position sensor and a bipolar masseter pair whose reference wire carries only
 hum and movement artefact), antral slow waves that grow after each meal, duodenal slow waves, and
@@ -76,14 +78,25 @@ ordinary Open Ephys recording, so Python syncview opens it too (see its `README.
 ## Run
 
 ```bash
+syncviewr                           # start page: drop a folder and/or a video, or try the demo
 syncviewr /path/to/folder           # finds the recording, video and preset inside it
 ```
 
-Given a folder, syncviewR searches it for the one Open Ephys recording (a folder containing
-`structure.oebin`), the one video (`.mp4`, `.mov`, `.avi`, `.mkv`) and a preset JSON at its top
-level (if there are several, the one named `preset.json`). This suits a shared sample or a session
-folder: in Terminal, type `syncviewr ` and drag the folder in from Finder. If a folder holds several
-recordings or videos, syncviewR lists them and you pick with the options below:
+**Start page.** Drag an Open Ephys folder onto the window, or click *Choose folder…*. The folder
+can be a whole day's session, a Record Node or one recording. If it holds several recordings, a
+list opens: move with the Up and Down arrow keys and press Enter to open one. Each recording
+shows its length, channels, start time and camera triggers. If the folder holds several videos,
+a second list asks which one goes with the recording, or none. You can drop one video along with
+the folder, or before it; dropping several videos at once is refused. A preset JSON at the top of
+the folder is used. While viewing, drop a video on the window to attach it, or drop another folder
+to go back to the start page with it.
+
+**A folder on the command line** works the same way. syncviewR searches it for Open Ephys
+recordings (folders containing `structure.oebin`, or `.nwb` files), videos (`.mp4`, `.mov`, `.avi`,
+`.mkv`) and a preset JSON at its top level (if there are several, the one named `preset.json`). With
+one recording and at most one video it opens them straight away. Otherwise the start page asks.
+In Terminal, you can type `syncviewr ` and drag the folder in from Finder. To skip the search,
+name the files:
 
 ```bash
 syncviewr --rec "/path/to/Record Node 101/experiment1/recording1" \
@@ -94,10 +107,10 @@ syncviewr --rec "/path/to/Record Node 101/experiment1/recording1" \
 | option | default | |
 |---|---|---|
 | `FOLDER` | | a folder to search for the recording, video and preset (above) |
-| `--rec FOLDER` | (required unless FOLDER or `--demo`) | Open Ephys recording folder (contains `structure.oebin`) |
+| `--rec FOLDER` | none (start page) | Open Ephys recording folder (contains `structure.oebin`) or `.nwb` file |
 | `--video FILE` | none | video recorded during this recording |
 | `--preset FILE.json` | built from the recording | same JSON as Python syncview |
-| `--stream NAME` | `acquisition_board` | Open Ephys continuous stream |
+| `--stream NAME` | `acquisition_board`, else the first stream | Open Ephys continuous stream |
 | `--trigger-line N` | `1` | TTL line with one pulse per video frame |
 | `--cache FOLDER` | `$SYNCVIEWR_CACHE`, else `~/.cache/syncviewr` (Linux), `~/Library/Caches/syncviewr` (macOS) | filtered traces |
 | `--time S`, `--time-base S`, `--play` | | initial position, view width, start playing |

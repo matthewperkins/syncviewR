@@ -10,6 +10,8 @@ mod gpu;
 mod npy;
 mod oe;
 mod preset;
+mod shell;
+mod splash;
 mod video;
 
 use anyhow::{Context, Result};
@@ -20,6 +22,9 @@ use std::sync::Arc;
 
 /// View Open Ephys recordings side by side with a behaviour video, frame-locked to the camera trigger.
 ///
+/// With no arguments it opens a start page: drop an Open Ephys folder and/or a video on it, or
+/// try the demo.
+///
 /// Mouse: scroll = zoom time, sideways swipe / Shift+scroll / drag = pan, ⌘/Ctrl+scroll = scale a
 /// row's Y, double-click = reset it; click or drag the overview strip to jump.
 /// Keys: ←/→ one video frame (Shift: 10 % of the view), PgUp/PgDn one view, Home/End, Space play,
@@ -27,12 +32,13 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(version, verbatim_doc_comment)]
 struct Cli {
-    /// a folder holding one Open Ephys recording, and optionally one video and one preset JSON
-    /// (e.g. a shared sample); they are found and opened together. --video / --preset override.
+    /// a folder holding an Open Ephys recording, and optionally one video and one preset JSON (e.g.
+    /// a shared sample); they are found and opened together. --video / --preset override. If it
+    /// holds several recordings or videos, the start page lists them to pick from.
     #[arg(value_name = "FOLDER", conflicts_with_all = ["rec", "demo"])]
     folder: Option<PathBuf>,
     /// Open Ephys recording folder (…/experimentN/recordingM, containing structure.oebin)
-    #[arg(long, required_unless_present_any = ["demo", "folder"])]
+    #[arg(long)]
     rec: Option<PathBuf>,
     /// try syncviewR on synthetic data: writes a 5-minute recording, a matching video and a preset
     /// (~100 MB) into DIR (default: the cache folder) on first use, then opens them
@@ -48,9 +54,10 @@ struct Cli {
     /// platform's user cache folder + /syncviewr). Pointing it at a Python syncview cache reuses it.
     #[arg(long)]
     cache: Option<PathBuf>,
-    /// Open Ephys continuous stream holding the data and the camera TTL
-    #[arg(long, default_value = "acquisition_board")]
-    stream: String,
+    /// Open Ephys continuous stream holding the data and the camera TTL (default:
+    /// acquisition_board, else the recording's first stream)
+    #[arg(long)]
+    stream: Option<String>,
     /// TTL line carrying one pulse per video frame
     #[arg(long, default_value_t = 1)]
     trigger_line: i64,
@@ -78,10 +85,10 @@ struct Cli {
 
 /// Window, Dock and ⌘-Tab icon (assets/icon.svg, made by assets/make_icon.py; rendered with
 /// `rsvg-convert -w 512 -h 512`).
-const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+pub(crate) const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> Result<()> {
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
     ffmpeg_next::init().context("initialising FFmpeg")?;
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Error);
     if let (Some(d), Some(v)) = (&cli.dump_frames, &cli.video) {
@@ -89,46 +96,37 @@ fn main() -> Result<()> {
         return video::dump_frames(v, &idx, std::path::Path::new(&d[1]));
     }
     let root = cli.cache.clone().unwrap_or_else(cache::default_root);
+    eprintln!("syncviewr: cache folder {}", root.display());
+    let mut start = shell::Start::Splash(vec![]);
     if let Some(dir) = &cli.demo {
         let d = demo::ensure(dir.as_ref().unwrap_or(&root))?;
-        cli.rec = Some(d.rec);
-        cli.video = cli.video.or(Some(d.video));
-        cli.preset = cli.preset.or(Some(d.preset));
-        cli.time = cli.time.or(Some(17.0)); // just before the first chewing bout
-    }
-    if let Some(dir) = &cli.folder {
-        let f = match folder::resolve(dir, cli.video.is_none(), cli.preset.is_none()) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("syncviewr: {e:#}");
-                std::process::exit(2);
+        let time = cli.time.or(Some(17.0)); // just before the first chewing bout
+        start = shell::Start::Viewer(splash::Launch { rec: d.rec, video: cli.video.clone().or(Some(d.video)), preset: cli.preset.clone().or(Some(d.preset)), time });
+    } else if let Some(dir) = &cli.folder {
+        start = match folder::resolve(dir, cli.video.is_none(), cli.preset.is_none()) {
+            Ok(f) => {
+                let show = |p: &Option<PathBuf>| p.as_ref().map_or("none".into(), |p| p.display().to_string());
+                eprintln!("syncviewr: recording {}", f.rec.display());
+                eprintln!("syncviewr: video {}", show(&f.video));
+                eprintln!("syncviewr: preset {}", show(&f.preset));
+                shell::Start::Viewer(splash::Launch {
+                    rec: f.rec,
+                    video: cli.video.clone().or(f.video),
+                    preset: cli.preset.clone().or(f.preset),
+                    time: cli.time,
+                })
             }
+            // several recordings or videos: let the start page ask which
+            Err(_) => shell::Start::Splash(vec![dir.clone()]),
         };
-        let show = |p: &Option<PathBuf>| p.as_ref().map_or("none".into(), |p| p.display().to_string());
-        eprintln!("syncviewr: recording {}", f.rec.display());
-        eprintln!("syncviewr: video {}", show(&f.video));
-        eprintln!("syncviewr: preset {}", show(&f.preset));
-        cli.rec = Some(f.rec);
-        cli.video = cli.video.or(f.video);
-        cli.preset = cli.preset.or(f.preset);
+    } else if let Some(rec) = &cli.rec {
+        start = shell::Start::Viewer(splash::Launch { rec: rec.clone(), video: cli.video.clone(), preset: cli.preset.clone(), time: cli.time });
     }
-    let rec = match oe::Recording::open(cli.rec.as_ref().unwrap(), &cli.stream) {
-        Ok(r) => Arc::new(r),
-        Err(e) => {
-            eprintln!("syncviewr: cannot open recording: {e:#}");
-            std::process::exit(2);
-        }
-    };
-    eprintln!("syncviewr: cache folder {}", root.display());
-    let cache = Arc::new(cache::TraceCache::new(rec.clone(), root)?);
-    let preset = match &cli.preset {
-        Some(p) => serde_json::from_str(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
-            .with_context(|| format!("parsing {}", p.display()))?,
-        None => preset::from_recording(&rec),
-    };
     if cli.build_only {
-        let p: preset::Preset = preset;
-        let (p, _) = preset::check(p, &rec);
+        let shell::Start::Viewer(l) = &start else { anyhow::bail!("--build-only needs one recording") };
+        let rec = Arc::new(oe::Recording::open(&l.rec, cli.stream.as_deref())?);
+        let cache = Arc::new(cache::TraceCache::new(rec.clone(), root)?);
+        let (p, _) = preset::check(shell::load_preset(&l.preset, &rec)?, &rec);
         let mut specs: Vec<preset::Spec> = p.channels.into_iter().filter(|s| s.show).collect();
         specs.extend(p.overview);
         let t0 = std::time::Instant::now();
@@ -136,31 +134,18 @@ fn main() -> Result<()> {
         eprintln!("\nsyncviewr: built {} traces in {:.1} s", specs.len(), t0.elapsed().as_secs_f64());
         return Ok(());
     }
-    let title = format!(
-        "syncviewR — {}/{}  ({:.2} h, {} Hz)",
-        rec.rec_dir.parent().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy(),
-        rec.rec_dir.file_name().unwrap_or_default().to_string_lossy(),
-        rec.duration() / 3600.0,
-        rec.fs
-    );
-    let opts = app::Options {
-        preset,
-        video: cli.video,
-        trigger_line: cli.trigger_line,
-        start_time: cli.time,
-        time_base: cli.time_base,
-        screenshot: cli.screenshot.map(|p| (p, cli.screenshot_after)),
-        play: cli.play,
-    };
+    let settings = shell::Settings { cache_root: root, stream: cli.stream, trigger_line: cli.trigger_line, time_base: cli.time_base, play: cli.play };
+    let screenshot = cli.screenshot.map(|p| (p, cli.screenshot_after));
     let native = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1700.0, 1000.0])
-            .with_title(&title)
+            .with_title("syncviewR")
             .with_app_id("syncviewr")
+            .with_drag_and_drop(true)
             .with_icon(Arc::new(eframe::icon_data::from_png_bytes(ICON_PNG).context("decoding the app icon")?)),
         ..Default::default()
     };
-    eframe::run_native("syncviewr", native, Box::new(move |cc| Ok(Box::new(app::App::new(cc, rec, cache, opts)))))
+    eframe::run_native("syncviewr", native, Box::new(move |cc| Ok(Box::new(shell::Shell::new(cc, settings, start, screenshot)))))
         .map_err(|e| anyhow::anyhow!("{e}"))
 }

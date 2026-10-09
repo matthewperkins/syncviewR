@@ -17,10 +17,10 @@ const RATES: [f64; 10] = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 100.0, 300.
 const TIME_BASES: [f64; 16] = [0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0, 7200.0];
 const WINDOW_MAX_S: f64 = 180.0; // on-demand (uncached) processing only for views up to this span
 const PALETTE: [&str; 6] = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"];
-const BG: Color32 = Color32::from_rgb(0x11, 0x11, 0x11);
-const FG: Color32 = Color32::from_rgb(0xc3, 0xc2, 0xb7);
-const LABEL: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xe4);
-const MUTED: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
+pub const BG: Color32 = Color32::from_rgb(0x11, 0x11, 0x11);
+pub const FG: Color32 = Color32::from_rgb(0xc3, 0xc2, 0xb7);
+pub const LABEL: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xe4);
+pub const MUTED: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
 const OVERVIEW_SLOT: usize = 10_000;
 
 // layout of the trace area (points), as in the Python viewer
@@ -36,7 +36,6 @@ pub struct Options {
     pub trigger_line: i64,
     pub start_time: Option<f64>,
     pub time_base: Option<f64>,
-    pub screenshot: Option<(PathBuf, f64)>,
     pub play: bool,
 }
 
@@ -184,9 +183,6 @@ pub struct App {
     status: String,
     dialogs: Vec<(String, String)>,
     was_building: bool,
-    screenshot: Option<(PathBuf, f64)>,
-    started: Instant,
-    shot_requested: bool,
     fps: Option<(Instant, Vec<f64>)>, // SYNCVIEWR_FPS=1: per-second frame-time report
 }
 
@@ -268,10 +264,9 @@ fn fmt_tick(v: f64, step: f64) -> String {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, rec: Arc<Recording>, cache: Arc<TraceCache>, opts: Options) -> Self {
-        crate::gpu::init(cc.wgpu_render_state.as_ref().expect("syncviewr needs the wgpu renderer"));
-        let ctx = cc.egui_ctx.clone();
-        ctx.set_visuals(egui::Visuals::dark());
+    /// The viewer for `rec`. The GPU line renderer must already be set up (`gpu::init`).
+    pub fn new(ctx: &egui::Context, rec: Arc<Recording>, cache: Arc<TraceCache>, opts: Options) -> Self {
+        let ctx = ctx.clone();
         let c1 = ctx.clone();
         let builder = CacheBuilder::new(cache.clone(), move || c1.request_repaint());
         let c2 = ctx.clone();
@@ -308,9 +303,6 @@ impl App {
             status: String::new(),
             dialogs: vec![],
             was_building: false,
-            screenshot: opts.screenshot,
-            started: Instant::now(),
-            shot_requested: false,
             fps: std::env::var_os("SYNCVIEWR_FPS").map(|_| (Instant::now(), vec![])),
             rec,
             cache,
@@ -437,7 +429,7 @@ impl App {
     }
 
     // ------------------------------------------------------------------ video
-    fn attach_video(&mut self, path: PathBuf, ctx: &egui::Context) {
+    pub fn attach_video(&mut self, path: PathBuf, ctx: &egui::Context) {
         let c = ctx.clone();
         self.video_msg = format!("opening {} …", path.file_name().unwrap_or_default().to_string_lossy());
         self.video_ready = false;
@@ -1125,34 +1117,10 @@ impl App {
             self.dialogs.remove(i);
         }
     }
-
-    fn screenshot(&mut self, ctx: &egui::Context) {
-        let Some((path, after)) = self.screenshot.clone() else { return };
-        if !self.shot_requested && self.started.elapsed().as_secs_f64() >= after {
-            self.shot_requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
-        }
-        let shot = ctx.input(|i| {
-            i.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None })
-        });
-        if let Some(img) = shot {
-            let [w, h] = img.size;
-            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-            for px in &img.pixels {
-                out.extend_from_slice(&[px.r(), px.g(), px.b()]);
-            }
-            match std::fs::write(&path, out) {
-                Ok(()) => eprintln!("syncviewr: screenshot saved to {}", path.display()),
-                Err(e) => eprintln!("syncviewr: screenshot failed: {e}"),
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl App {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if let Some((last, times)) = &mut self.fps {
             times.push(ctx.input(|i| i.unstable_dt) as f64 * 1000.0);
@@ -1200,7 +1168,6 @@ impl eframe::App for App {
         if self.playing {
             ctx.request_repaint();
         }
-        self.screenshot(&ctx);
     }
 }
 

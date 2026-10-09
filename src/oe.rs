@@ -19,9 +19,15 @@ pub struct Recording {
 }
 
 impl Recording {
-    pub fn open(rec_dir: &Path, stream: &str) -> Result<Self> {
+    /// `stream` None: `acquisition_board` if there is one (GUI 1.0), else the first stream (GUI 0.6
+    /// calls it e.g. `Rhythm Data`).
+    pub fn open(rec_dir: &Path, stream: Option<&str>) -> Result<Self> {
         let rec = openephys::Recording::open(rec_dir)?;
-        let c = rec.stream(stream)?;
+        let c = match stream {
+            Some(s) => rec.stream(s)?,
+            None => rec.stream("acquisition_board").or_else(|_| rec.main_stream())?,
+        };
+        let stream = c.name().to_string();
         let index = rec.continuous().iter().position(|x| std::ptr::eq(x, c)).unwrap();
         if !c.is_contiguous() {
             eprintln!("syncviewr: warning: continuous sample numbers are not contiguous (dropped samples?) - sync may be off.");
