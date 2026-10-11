@@ -469,9 +469,9 @@ impl App {
                         self.frame_rows = si.frames.clone();
                         self.frame_period = si.period;
                         self.status = format!(
-                            "{name}: {} frames {}×{}, {} extra trigger(s) dropped; video spans {} – {}; decoding on CPU (FFmpeg)",
+                            "{name}: {} frames {}×{}, {} extra trigger(s) dropped; video spans {} – {}; decoder: {}",
                             info.n_frames, info.width, info.height, si.extra,
-                            fmt_time(self.frames[0], None), fmt_time(*self.frames.last().unwrap(), None)
+                            fmt_time(self.frames[0], None), fmt_time(*self.frames.last().unwrap(), None), info.backend
                         );
                         if self.t < self.frames[0] || self.t > *self.frames.last().unwrap() {
                             self.t = self.frames[0];

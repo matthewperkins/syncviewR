@@ -90,6 +90,10 @@ jobs:
           mkdir -p clip-test
           "$exe" --demo "$RUNNER_TEMP/demo" --cache "$RUNNER_TEMP/cache" --export-clip clip-test/demo-clip-$RUNNER_OS.mp4 --clip-from 20 --clip-to 22
           ls -l clip-test
+          # decoder speed and which decoder is used (VideoToolbox on macOS): the demo video (MPEG-4)
+          # and the clip just made (H.264)
+          "$exe" --bench-video "$RUNNER_TEMP"/demo/syncviewr_demo_v*/demo_camera.mp4
+          "$exe" --bench-video clip-test/demo-clip-$RUNNER_OS.mp4
 
       # ---- Windows GUI check: open the start page, and the viewer on the demo, and save
       # screenshots (the runner draws with Windows' software renderer)

@@ -107,6 +107,9 @@ struct Cli {
     /// (testing) decode these comma-separated frame indexes of --video into raw RGB files in DIR
     #[arg(long, hide = true, value_names = ["INDEXES", "DIR"], num_args = 2)]
     dump_frames: Option<Vec<String>>,
+    /// (testing) time software and hardware decoding of this video, then exit
+    #[arg(long, hide = true, value_name = "VIDEO")]
+    bench_video: Option<PathBuf>,
 }
 
 /// Window, Dock and ⌘-Tab icon (assets/icon.svg, made by assets/make_icon.py; rendered with
@@ -142,6 +145,9 @@ fn main() -> Result<()> {
     if let (Some(d), Some(v)) = (&cli.dump_frames, &cli.video) {
         let idx: Vec<usize> = d[0].split(',').map(|s| s.parse()).collect::<Result<_, _>>()?;
         return video::dump_frames(v, &idx, std::path::Path::new(&d[1]));
+    }
+    if let Some(v) = &cli.bench_video {
+        return video::bench(v);
     }
     let root = cli.cache.clone().unwrap_or_else(cache::default_root);
     eprintln!("syncviewr: cache folder {}", root.display());
