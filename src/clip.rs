@@ -407,6 +407,11 @@ impl Encoder {
         let st_tb = self.octx.stream(self.stream).unwrap().time_base();
         while self.enc.receive_packet(&mut pkt).is_ok() {
             pkt.set_stream(self.stream);
+            if pkt.duration() == 0 {
+                // one frame: encoders leave it 0, and the MP4's edit list then ends where the last
+                // frame starts, so players drop that frame
+                pkt.set_duration(1);
+            }
             pkt.rescale_ts(self.tb, st_tb);
             pkt.write_interleaved(&mut self.octx)?;
         }

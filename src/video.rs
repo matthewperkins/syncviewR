@@ -601,19 +601,21 @@ pub fn bench(path: &Path) -> Result<()> {
         // the same frames decoded only (no download or conversion to RGB)
         dec.seek_to_index(0)?;
         let t0 = Instant::now();
-        for _ in 0..m {
-            dec.decoded()?;
+        let mut got = 0;
+        while got < m && dec.decoded()?.is_some() {
+            got += 1;
         }
-        let decode_fps = m as f64 / t0.elapsed().as_secs_f64();
+        let decode_fps = got as f64 / t0.elapsed().as_secs_f64();
         dec.seek_to_index(0)?;
-        let mut busy = 0.0;
-        for _ in 0..m.min(200) {
-            let f = dec.decoded()?.context("no frame")?;
+        let (mut busy, mut got) = (0.0, 0);
+        while got < m.min(200) {
+            let Some(f) = dec.decoded()? else { break };
             let t0 = Instant::now();
             dec.to_rgb(&f, 0)?;
             busy += t0.elapsed().as_secs_f64();
+            got += 1;
         }
-        let rgb_ms = busy * 1e3 / m.min(200) as f64;
+        let rgb_ms = busy * 1e3 / got.max(1) as f64;
         let mut x: u64 = 0x2545_f491_4f6c_dd1d;
         let mut jumps = vec![];
         for _ in 0..40 {
