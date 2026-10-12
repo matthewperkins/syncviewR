@@ -400,66 +400,92 @@ impl Drop for CacheBuilder {
 /// Processes just a window of data for specs that aren't cached yet (fast feedback while the
 /// whole-session build runs). Results land in `results`, keyed by cache key.
 pub struct WindowWorker {
-    job: Arc<(Mutex<Option<(Vec<Spec>, f64, f64)>>, Condvar)>,
+    job: Arc<(Mutex<WindowJob>, Condvar)>,
     pub results: Arc<Mutex<HashMap<String, (f64, f64, Arc<Trace>)>>>,
     stop: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct WindowJob {
+    next: Option<(Vec<Spec>, f64, f64)>,
+    running: Option<(HashSet<String>, f64, f64)>, // keys and window of the job in progress
+}
+
 impl WindowWorker {
-    pub fn new(cache: Arc<TraceCache>, on_change: impl Fn() + Send + 'static) -> Self {
-        let job: Arc<(Mutex<Option<(Vec<Spec>, f64, f64)>>, Condvar)> = Default::default();
+    pub fn new(cache: Arc<TraceCache>, on_change: impl Fn() + Send + Sync + 'static) -> Self {
+        let job: Arc<(Mutex<WindowJob>, Condvar)> = Default::default();
         let results: Arc<Mutex<HashMap<String, (f64, f64, Arc<Trace>)>>> = Default::default();
         let stop = Arc::new(AtomicBool::new(false));
         let (jb, res, stp) = (job.clone(), results.clone(), stop.clone());
+        // its own threads, so the preview isn't queued behind the whole-session build's work
+        let pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("window-{i}"))
+            .build()
+            .expect("window worker threads");
         std::thread::Builder::new()
             .name("window-worker".into())
             .spawn(move || loop {
                 let (specs, t_lo, t_hi) = {
                     let (m, cv) = &*jb;
                     let mut j = m.lock().unwrap();
-                    while j.is_none() && !stp.load(Ordering::Relaxed) {
+                    j.running = None;
+                    while j.next.is_none() && !stp.load(Ordering::Relaxed) {
                         j = cv.wait(j).unwrap();
                     }
                     if stp.load(Ordering::Relaxed) {
                         return;
                     }
-                    j.take().unwrap()
+                    let (specs, t_lo, t_hi) = j.next.take().unwrap();
+                    j.running = Some((specs.iter().map(|s| cache.key(s)).collect(), t_lo, t_hi));
+                    (specs, t_lo, t_hi)
                 };
                 let rec = &cache.rec;
                 let fs = rec.fs;
                 let i0 = (t_lo.max(0.0) * fs) as i64;
                 let i1 = (t_hi.min(rec.duration()) * fs) as i64;
-                for s in &specs {
-                    if jb.0.lock().unwrap().is_some() {
-                        break; // superseded
-                    }
-                    let pad = pad_samples(s, fs) as i64;
-                    let (first, len) = rec.clip(i0 - pad, i1 + pad);
-                    let Some(ch) = rec.ch(&s.ch) else { continue };
-                    let r = s.reference.as_deref().filter(|r| !r.is_empty()).and_then(|r| rec.ch(r));
-                    match process(rec.trace(ch, r, first, len), first as i64, fs, s) {
-                        Ok((y, a, step)) => {
-                            let k0 = ((i0 - a).max(0) as usize).div_ceil(step as usize);
-                            let k1 = (((i1 - a).max(0) as usize).div_ceil(step as usize)).min(y.len());
-                            if k1 > k0 + 1 {
-                                let t0 = (a + k0 as i64 * step) as f64 / fs;
-                                let ys: Vec<f32> = y[k0..k1].iter().map(|v| *v as f32).collect();
-                                let tr = Trace::from_samples(t0, step as f64 / fs, ys);
-                                res.lock().unwrap().insert(cache.key(s), (t_lo, t_hi, Arc::new(tr)));
-                                on_change();
-                            }
+                pool.install(|| {
+                    specs.par_iter().with_max_len(1).for_each(|s| {
+                        if jb.0.lock().unwrap().next.is_some() {
+                            return; // superseded
                         }
-                        Err(e) => eprintln!("syncviewr: {e:#}"),
-                    }
-                }
+                        let pad = pad_samples(s, fs) as i64;
+                        let (first, len) = rec.clip(i0 - pad, i1 + pad);
+                        let Some(ch) = rec.ch(&s.ch) else { return };
+                        let r = s.reference.as_deref().filter(|r| !r.is_empty()).and_then(|r| rec.ch(r));
+                        match process(rec.trace(ch, r, first, len), first as i64, fs, s) {
+                            Ok((y, a, step)) => {
+                                let k0 = ((i0 - a).max(0) as usize).div_ceil(step as usize);
+                                let k1 = (((i1 - a).max(0) as usize).div_ceil(step as usize)).min(y.len());
+                                if k1 > k0 + 1 {
+                                    let t0 = (a + k0 as i64 * step) as f64 / fs;
+                                    let ys: Vec<f32> = y[k0..k1].iter().map(|v| *v as f32).collect();
+                                    let tr = Trace::from_samples(t0, step as f64 / fs, ys);
+                                    res.lock().unwrap().insert(cache.key(s), (t_lo, t_hi, Arc::new(tr)));
+                                    on_change();
+                                }
+                            }
+                            Err(e) => eprintln!("syncviewr: {e:#}"),
+                        }
+                    })
+                });
             })
             .expect("spawn window worker");
         WindowWorker { job, results, stop }
     }
 
-    pub fn request(&self, specs: Vec<Spec>, t_lo: f64, t_hi: f64) {
+    /// Asks for `specs` over [t_lo, t_hi], replacing any earlier request. Repeating the request
+    /// that's already being worked on (the viewer asks on every repaint) is a no-op.
+    pub fn request(&self, specs: Vec<Spec>, t_lo: f64, t_hi: f64, cache: &TraceCache) {
         let (m, cv) = &*self.job;
-        *m.lock().unwrap() = Some((specs, t_lo, t_hi));
+        let mut j = m.lock().unwrap();
+        let repeat = match (&j.next, &j.running) {
+            (None, Some((keys, lo, hi))) => *lo == t_lo && *hi == t_hi && specs.iter().all(|s| keys.contains(&cache.key(s))),
+            _ => false,
+        };
+        if repeat {
+            return;
+        }
+        j.next = Some((specs, t_lo, t_hi));
         cv.notify_all();
     }
 }

@@ -1026,7 +1026,7 @@ impl App {
         }
         // on-demand processing of the visible window for rows that aren't cached yet
         if !need_window.is_empty() {
-            self.window_worker.request(need_window, t_lo - span, t_hi + span);
+            self.window_worker.request(need_window, t_lo - span, t_hi + span, &self.cache);
         }
         // mouse
         let hover_row = resp.hover_pos().and_then(|p| {
