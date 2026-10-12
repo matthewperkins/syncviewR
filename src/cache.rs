@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub const FACTOR: usize = 8;
@@ -192,9 +192,9 @@ impl TraceCache {
         specs.iter().filter(|s| self.get(s).is_none() && seen.insert(self.key(s))).cloned().collect()
     }
 
-    /// Process every not-yet-cached spec over the whole recording. progress(fraction) after each
-    /// chunk; cancel() returning true aborts (partial results are removed). Returns Ok(false) if cancelled.
-    pub fn build(&self, specs: &[Spec], progress: &dyn Fn(f64), cancel: &dyn Fn() -> bool) -> Result<bool> {
+    /// Process every not-yet-cached spec over the whole recording. progress(fraction) as pieces
+    /// finish (from worker threads); cancel() returning true aborts (partial results are removed). Returns Ok(false) if cancelled.
+    pub fn build(&self, specs: &[Spec], progress: &(dyn Fn(f64) + Sync), cancel: &(dyn Fn() -> bool + Sync)) -> Result<bool> {
         let specs = self.missing(specs);
         if specs.is_empty() {
             return Ok(true);
@@ -230,37 +230,87 @@ impl TraceCache {
                 wanted.push((col(ch), r.map(col)));
             }
             let bv: Vec<f64> = chans.iter().map(|c| rec.bit_volts(*c)).collect();
-            let mut c0 = 0;
-            while c0 < n {
-                if cancel() {
-                    return Ok(false);
+            // Each (chunk, spec) pair is its own task, so a chunk's quick specs don't wait for its
+            // slow ones and the next chunk is read while this one is filtered. Chunk boundaries and
+            // arithmetic are unchanged, so the cached values are too.
+            let maps: Vec<Mutex<npy::F32MapMut>> = maps.into_iter().map(Mutex::new).collect();
+            let n_chunks = n.div_ceil(chunk);
+            let n_tasks = n_chunks * specs.len();
+            let done = AtomicUsize::new(0);
+            let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+            let in_flight = (Mutex::new(vec![0usize; n_chunks]), Condvar::new()); // unfinished tasks per chunk
+            let halted = AtomicBool::new(false); // sticky: once a task has been skipped, the build is void
+            let stopped = || {
+                let stop = halted.load(Ordering::Relaxed) || cancel() || error.lock().unwrap().is_some();
+                if stop {
+                    halted.store(true, Ordering::Relaxed);
                 }
-                let c1 = (c0 + chunk).min(n);
-                let (first, len) = rec.clip(c0 as i64 - pad, c1 as i64 + pad);
-                let cols = rec.raw_columns(&chans, first, len);
-                maps.par_iter_mut().zip(&specs).zip(&steps).zip(&wanted).try_for_each(|(((map, s), &st), &(a, r))| -> Result<()> {
-                    let out = map.as_mut_slice();
-                    // same arithmetic as Recording::trace, so cached values don't change
-                    let x: Vec<f64> = match r {
-                        None => cols[a].iter().map(|v| *v as f64 * bv[a]).collect(),
-                        Some(b) => cols[a].iter().zip(&cols[b]).map(|(u, w)| *u as f64 * bv[a] - *w as f64 * bv[b]).collect(),
-                    };
-                    let (y, a, st2) = process(x, first as i64, fs, s)?;
-                    debug_assert_eq!(st2 as usize, st);
-                    let k0 = ((c0 as i64 - a) / st as i64).max(0) as usize;
-                    let k1 = (k0 + (c1 - c0).div_ceil(st)).min(y.len());
-                    let o0 = c0 / st;
-                    for (j, v) in y[k0..k1].iter().enumerate() {
-                        if o0 + j < out.len() {
-                            out[o0 + j] = *v as f32;
+                stop
+            };
+            rayon::in_place_scope_fifo(|scope| {
+                for i in 0..n_chunks {
+                    // at most two chunks in memory: wait for chunk i-2 to finish before reading chunk i
+                    {
+                        let (m, cv) = &in_flight;
+                        let mut left = m.lock().unwrap();
+                        while i >= 2 && left[i - 2] > 0 {
+                            left = cv.wait(left).unwrap();
                         }
+                        left[i] = specs.len();
                     }
-                    Ok(())
-                })?;
-                drop(cols);
-                progress(c1 as f64 / n as f64);
-                c0 = c1;
+                    if stopped() {
+                        break;
+                    }
+                    let c0 = i * chunk;
+                    let c1 = (c0 + chunk).min(n);
+                    let (first, len) = rec.clip(c0 as i64 - pad, c1 as i64 + pad);
+                    let cols = Arc::new(rec.raw_columns(&chans, first, len));
+                    for (j, s) in specs.iter().enumerate() {
+                        let (cols, bv, maps, steps, wanted) = (cols.clone(), &bv, &maps, &steps, &wanted);
+                        let (done, error, in_flight, stopped) = (&done, &error, &in_flight, &stopped);
+                        scope.spawn_fifo(move |_| {
+                            if !stopped() {
+                                let (st, (a, r)) = (steps[j], wanted[j]);
+                                let run = || -> Result<()> {
+                                    // same arithmetic as Recording::trace, so cached values don't change
+                                    let x: Vec<f64> = match r {
+                                        None => cols[a].iter().map(|v| *v as f64 * bv[a]).collect(),
+                                        Some(b) => cols[a].iter().zip(&cols[b]).map(|(u, w)| *u as f64 * bv[a] - *w as f64 * bv[b]).collect(),
+                                    };
+                                    let (y, a, st2) = process(x, first as i64, fs, s)?;
+                                    debug_assert_eq!(st2 as usize, st);
+                                    let k0 = ((c0 as i64 - a) / st as i64).max(0) as usize;
+                                    let k1 = (k0 + (c1 - c0).div_ceil(st)).min(y.len());
+                                    let o0 = c0 / st;
+                                    let mut map = maps[j].lock().unwrap();
+                                    let out = map.as_mut_slice();
+                                    for (k, v) in y[k0..k1].iter().enumerate() {
+                                        if o0 + k < out.len() {
+                                            out[o0 + k] = *v as f32;
+                                        }
+                                    }
+                                    Ok(())
+                                };
+                                if let Err(e) = run() {
+                                    error.lock().unwrap().get_or_insert(e);
+                                }
+                                progress((done.fetch_add(1, Ordering::Relaxed) + 1) as f64 / n_tasks as f64);
+                            }
+                            drop(cols);
+                            let (m, cv) = in_flight;
+                            m.lock().unwrap()[i] -= 1;
+                            cv.notify_all();
+                        });
+                    }
+                }
+            });
+            if let Some(e) = error.into_inner().unwrap() {
+                return Err(e);
             }
+            if halted.into_inner() {
+                return Ok(false);
+            }
+            let maps: Vec<npy::F32MapMut> = maps.into_iter().map(|m| m.into_inner().unwrap()).collect();
             // finish each trace (zoom pyramid, stats, metadata, move into place) in parallel; the
             // mapped level0 files need no flush, as readers map the same pages
             if cancel() {
@@ -334,7 +384,7 @@ struct BuildState {
 }
 
 impl CacheBuilder {
-    pub fn new(cache: Arc<TraceCache>, on_change: impl Fn() + Send + 'static) -> Self {
+    pub fn new(cache: Arc<TraceCache>, on_change: impl Fn() + Send + Sync + 'static) -> Self {
         let state: Arc<(Mutex<BuildState>, Condvar)> = Default::default();
         let progress = Arc::new(Mutex::new(None));
         let (st, pr) = (state.clone(), progress.clone());

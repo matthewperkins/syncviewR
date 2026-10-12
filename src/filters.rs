@@ -321,53 +321,69 @@ fn sosfilt_zi(sos: &Sos) -> Vec<[f64; 2]> {
         .collect()
 }
 
-/// Filter the samples `x` yields, in that order, through all sections, with initial state zi * x0.
-/// All sections are applied to each sample in turn (rather than each section to the whole array),
-/// so a long trace passes through memory once; the arithmetic per sample is the same.
-fn sosfilt_inplace<'a>(sos: &Sos, x: impl Iterator<Item = &'a mut f64>, zi: &[[f64; 2]], x0: f64) {
-    let mut z: Vec<[f64; 2]> = zi.iter().map(|z| [z[0] * x0, z[1] * x0]).collect();
-    for v in x {
-        let mut xi = *v;
-        for (s, z) in sos.iter().zip(z.iter_mut()) {
+/// A cascade of second-order sections (scipy's sosfilt, direct form II transposed), one sample at a time.
+struct Cascade<'a> {
+    sos: &'a Sos,
+    z: Vec<[f64; 2]>,
+}
+
+impl<'a> Cascade<'a> {
+    /// Initial state zi * x0 (scipy's sosfilt_zi scaled by the first input).
+    fn new(sos: &'a Sos, zi: &[[f64; 2]], x0: f64) -> Self {
+        Cascade { sos, z: zi.iter().map(|z| [z[0] * x0, z[1] * x0]).collect() }
+    }
+
+    #[inline(always)]
+    fn step(&mut self, mut xi: f64) -> f64 {
+        for (s, z) in self.sos.iter().zip(self.z.iter_mut()) {
             let (b0, b1, b2, a1, a2) = (s[0], s[1], s[2], s[4], s[5]);
             let y = b0 * xi + z[0];
             z[0] = b1 * xi - a1 * y + z[1];
             z[1] = b2 * xi - a2 * y;
             xi = y;
         }
-        *v = xi;
+        xi
     }
 }
 
 /// scipy.signal.sosfiltfilt(sos, x) (padtype "odd", default padlen). Returns x unchanged if it is
 /// too short for the padding (scipy raises).
-pub fn sosfiltfilt(sos: &Sos, x: &[f64]) -> Vec<f64> {
+///
+/// Filters x in place, with only the odd extensions at each end held separately: with every core
+/// filtering long traces at once, memory traffic costs more than the arithmetic, and a padded
+/// copy (plus trimming it afterwards) streams the whole trace twice more. Same arithmetic as
+/// filtering a padded copy.
+pub fn sosfiltfilt(sos: &Sos, mut x: Vec<f64>) -> Vec<f64> {
     let nzb = sos.iter().filter(|s| s[2] == 0.0).count();
     let nza = sos.iter().filter(|s| s[5] == 0.0).count();
     let ntaps = 2 * sos.len() + 1 - nzb.min(nza);
     let edge = 3 * ntaps;
     let n = x.len();
     if n <= edge {
-        return x.to_vec();
+        return x;
     }
-    // odd extension
-    let mut ext = Vec::with_capacity(n + 2 * edge);
-    ext.extend((1..=edge).rev().map(|i| 2.0 * x[0] - x[i]));
-    ext.extend_from_slice(x);
-    ext.extend((0..edge).map(|i| 2.0 * x[n - 1] - x[n - 2 - i]));
     let zi = sosfilt_zi(sos);
-    let x0 = ext[0];
-    sosfilt_inplace(sos, ext.iter_mut(), &zi, x0);
-    let y0 = ext[ext.len() - 1];
-    sosfilt_inplace(sos, ext.iter_mut().rev(), &zi, y0);
-    ext.truncate(edge + n);
-    ext.drain(..edge);
-    ext
+    // odd extension: 2 x[0] - x[edge..0] before, 2 x[n-1] - x[n-2..n-2-edge] after
+    let mut head: Vec<f64> = (1..=edge).rev().map(|i| 2.0 * x[0] - x[i]).collect();
+    let mut tail: Vec<f64> = (0..edge).map(|i| 2.0 * x[n - 1] - x[n - 2 - i]).collect();
+    let mut f = Cascade::new(sos, &zi, head[0]);
+    for v in head.iter_mut().chain(x.iter_mut()).chain(tail.iter_mut()) {
+        *v = f.step(*v);
+    }
+    // backward pass; outputs for the padding are dropped (and the head's needn't be computed)
+    let mut b = Cascade::new(sos, &zi, tail[edge - 1]);
+    for v in tail.iter().rev() {
+        b.step(*v);
+    }
+    for v in x.iter_mut().rev() {
+        *v = b.step(*v);
+    }
+    x
 }
 
 fn filt(x: Vec<f64>, fs: f64, lo: Option<f64>, hi: Option<f64>, order: usize) -> Vec<f64> {
     match butter_sos(order, lo, hi, fs) {
-        Some(sos) => sosfiltfilt(&sos, &x),
+        Some(sos) => sosfiltfilt(&sos, x),
         None => x,
     }
 }
@@ -514,7 +530,7 @@ pub fn process(x: Vec<f64>, a: i64, fs: f64, spec: &Spec) -> Result<(Vec<f64>, i
             let (mut y, a) = fir_decimate(&x, a, d, &h);
             drop(x);
             for f0 in notches {
-                y = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs1)], &y);
+                y = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs1)], y);
             }
             let y = filt(y, fs1, None, hi, order);
             let y = filt(y, fs1, lo, None, order);
@@ -522,7 +538,7 @@ pub fn process(x: Vec<f64>, a: i64, fs: f64, spec: &Spec) -> Result<(Vec<f64>, i
         }
     }
     for f0 in p.notch() {
-        x = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs)], &x);
+        x = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs)], x);
     }
     match spec.mode.as_str() {
         "hilo" => Ok((filt(x, fs, lo, hi, order), a, 1)),
