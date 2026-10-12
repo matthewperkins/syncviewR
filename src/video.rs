@@ -4,10 +4,11 @@
 //! no decoding), so indexing stays frame-exact even when timestamps jitter. The sorted timestamps
 //! are cached as `<cache>/video_index/<stem>.<hash>.npy`, the same file Python syncview writes.
 //!
-//! On macOS decoding uses VideoToolbox (the Mac's hardware decoder) when it handles the codec, and
-//! falls back to software otherwise, or if it fails. Elsewhere it's software unless
-//! `SYNCVIEWR_HWDEC=<FFmpeg device type>` (vaapi, cuda, d3d11va, …) asks for hardware, and FFmpeg
-//! was built with it; `SYNCVIEWR_HWDEC=off` forces software on macOS.
+//! Decoding is in software unless `SYNCVIEWR_HWDEC=<FFmpeg device type>` (videotoolbox, vaapi,
+//! cuda, d3d11va, …) asks for a hardware decoder and FFmpeg was built with it; it falls back to
+//! software if that decoder can't handle the video or fails. Software is the default because it
+//! was faster: on an M4, 1280×600 HEVC jumps took 41 ms in software and 79 ms with VideoToolbox
+//! (FFmpeg waits for each hardware frame in turn, while software decodes several at once).
 
 use crate::npy;
 use anyhow::{bail, Context, Result};
@@ -91,7 +92,6 @@ fn hw_device_type() -> Option<ff::ffi::AVHWDeviceType> {
             }
             Some(t)
         }
-        None if cfg!(target_os = "macos") => Some(AV_HWDEVICE_TYPE_VIDEOTOOLBOX),
         None => None,
     }
 }
