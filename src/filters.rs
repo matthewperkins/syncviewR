@@ -321,28 +321,78 @@ fn sosfilt_zi(sos: &Sos) -> Vec<[f64; 2]> {
         .collect()
 }
 
-/// A cascade of second-order sections (scipy's sosfilt, direct form II transposed), one sample at a time.
-struct Cascade<'a> {
-    sos: &'a Sos,
-    z: Vec<[f64; 2]>,
+/// Filter state of a cascade of second-order sections (scipy's sosfilt, direct form II
+/// transposed), for L traces at once. The number of sections N is fixed at compile time so the
+/// state stays in registers; in a heap array, every sample's chain of dependent operations would
+/// also wait on a store and a reload. The lanes are independent chains, which the CPU overlaps
+/// (and runs in vector registers). Per lane, the arithmetic is the same as one trace alone.
+struct Sections<const N: usize, const L: usize> {
+    c: [[f64; 5]; N], // b0 b1 b2 a1 a2
+    z: [[[f64; L]; 2]; N],
 }
 
-impl<'a> Cascade<'a> {
-    /// Initial state zi * x0 (scipy's sosfilt_zi scaled by the first input).
-    fn new(sos: &'a Sos, zi: &[[f64; 2]], x0: f64) -> Self {
-        Cascade { sos, z: zi.iter().map(|z| [z[0] * x0, z[1] * x0]).collect() }
+/// The same with N chosen at run time (state on the heap), for unusually high orders.
+struct SectionsDyn<const L: usize> {
+    c: Vec<[f64; 5]>,
+    z: Vec<[[f64; L]; 2]>,
+}
+
+trait Cascade<const L: usize> {
+    /// Initial state zi * x0 (scipy's sosfilt_zi scaled by each lane's first input).
+    fn new(sos: &Sos, zi: &[[f64; 2]], x0: [f64; L]) -> Self;
+    /// Filter the samples `x` yields, in that order, in place.
+    fn run<'a>(&mut self, x: impl Iterator<Item = &'a mut [f64; L]>);
+}
+
+impl<const L: usize> Cascade<L> for SectionsDyn<L> {
+    fn new(sos: &Sos, zi: &[[f64; 2]], x0: [f64; L]) -> Self {
+        SectionsDyn {
+            c: sos.iter().map(|s| [s[0], s[1], s[2], s[4], s[5]]).collect(),
+            z: zi.iter().map(|z| [x0.map(|v| z[0] * v), x0.map(|v| z[1] * v)]).collect(),
+        }
+    }
+
+    fn run<'a>(&mut self, x: impl Iterator<Item = &'a mut [f64; L]>) {
+        for v in x {
+            let mut xi = *v;
+            for (&[b0, b1, b2, a1, a2], z) in self.c.iter().zip(self.z.iter_mut()) {
+                for l in 0..L {
+                    let y = b0 * xi[l] + z[0][l];
+                    z[0][l] = b1 * xi[l] - a1 * y + z[1][l];
+                    z[1][l] = b2 * xi[l] - a2 * y;
+                    xi[l] = y;
+                }
+            }
+            *v = xi;
+        }
+    }
+}
+
+impl<const N: usize, const L: usize> Cascade<L> for Sections<N, L> {
+    fn new(sos: &Sos, zi: &[[f64; 2]], x0: [f64; L]) -> Self {
+        Sections {
+            c: std::array::from_fn(|k| [sos[k][0], sos[k][1], sos[k][2], sos[k][4], sos[k][5]]),
+            z: std::array::from_fn(|k| [x0.map(|v| zi[k][0] * v), x0.map(|v| zi[k][1] * v)]),
+        }
     }
 
     #[inline(always)]
-    fn step(&mut self, mut xi: f64) -> f64 {
-        for (s, z) in self.sos.iter().zip(self.z.iter_mut()) {
-            let (b0, b1, b2, a1, a2) = (s[0], s[1], s[2], s[4], s[5]);
-            let y = b0 * xi + z[0];
-            z[0] = b1 * xi - a1 * y + z[1];
-            z[1] = b2 * xi - a2 * y;
-            xi = y;
+    fn run<'a>(&mut self, x: impl Iterator<Item = &'a mut [f64; L]>) {
+        let (c, mut z) = (self.c, self.z);
+        for v in x {
+            let mut xi = *v;
+            for k in 0..N {
+                let [b0, b1, b2, a1, a2] = c[k];
+                for l in 0..L {
+                    let y = b0 * xi[l] + z[k][0][l];
+                    z[k][0][l] = b1 * xi[l] - a1 * y + z[k][1][l];
+                    z[k][1][l] = b2 * xi[l] - a2 * y;
+                    xi[l] = y;
+                }
+            }
+            *v = xi;
         }
-        xi
+        self.z = z;
     }
 }
 
@@ -354,31 +404,46 @@ impl<'a> Cascade<'a> {
 /// copy (plus trimming it afterwards) streams the whole trace twice more. Same arithmetic as
 /// filtering a padded copy.
 pub fn sosfiltfilt(sos: &Sos, mut x: Vec<f64>) -> Vec<f64> {
+    sosfiltfilt_lanes::<1>(sos, bytemuck::cast_slice_mut(&mut x));
+    x
+}
+
+/// sosfiltfilt of L equally long traces at once (sample i of trace l at x[i][l]), in place; each
+/// comes out exactly as sosfiltfilt would return it.
+fn sosfiltfilt_lanes<const L: usize>(sos: &Sos, x: &mut [[f64; L]]) {
+    match sos.len() {
+        1 => filtfilt::<Sections<1, L>, L>(sos, x),
+        2 => filtfilt::<Sections<2, L>, L>(sos, x),
+        3 => filtfilt::<Sections<3, L>, L>(sos, x),
+        4 => filtfilt::<Sections<4, L>, L>(sos, x),
+        5 => filtfilt::<Sections<5, L>, L>(sos, x),
+        6 => filtfilt::<Sections<6, L>, L>(sos, x),
+        7 => filtfilt::<Sections<7, L>, L>(sos, x),
+        8 => filtfilt::<Sections<8, L>, L>(sos, x),
+        _ => filtfilt::<SectionsDyn<L>, L>(sos, x),
+    }
+}
+
+fn filtfilt<C: Cascade<L>, const L: usize>(sos: &Sos, x: &mut [[f64; L]]) {
     let nzb = sos.iter().filter(|s| s[2] == 0.0).count();
     let nza = sos.iter().filter(|s| s[5] == 0.0).count();
     let ntaps = 2 * sos.len() + 1 - nzb.min(nza);
     let edge = 3 * ntaps;
     let n = x.len();
     if n <= edge {
-        return x;
+        return;
     }
     let zi = sosfilt_zi(sos);
     // odd extension: 2 x[0] - x[edge..0] before, 2 x[n-1] - x[n-2..n-2-edge] after
-    let mut head: Vec<f64> = (1..=edge).rev().map(|i| 2.0 * x[0] - x[i]).collect();
-    let mut tail: Vec<f64> = (0..edge).map(|i| 2.0 * x[n - 1] - x[n - 2 - i]).collect();
-    let mut f = Cascade::new(sos, &zi, head[0]);
-    for v in head.iter_mut().chain(x.iter_mut()).chain(tail.iter_mut()) {
-        *v = f.step(*v);
-    }
+    let lanes = |f: &dyn Fn(usize) -> f64| -> [f64; L] { std::array::from_fn(f) };
+    let mut head: Vec<[f64; L]> = (1..=edge).rev().map(|i| lanes(&|l| 2.0 * x[0][l] - x[i][l])).collect();
+    let mut tail: Vec<[f64; L]> = (0..edge).map(|i| lanes(&|l| 2.0 * x[n - 1][l] - x[n - 2 - i][l])).collect();
+    let mut f = C::new(sos, &zi, head[0]);
+    f.run(head.iter_mut().chain(x.iter_mut()).chain(tail.iter_mut()));
     // backward pass; outputs for the padding are dropped (and the head's needn't be computed)
-    let mut b = Cascade::new(sos, &zi, tail[edge - 1]);
-    for v in tail.iter().rev() {
-        b.step(*v);
-    }
-    for v in x.iter_mut().rev() {
-        *v = b.step(*v);
-    }
-    x
+    let mut b = C::new(sos, &zi, tail[edge - 1]);
+    b.run(tail.iter_mut().rev());
+    b.run(x.iter_mut().rev());
 }
 
 fn filt(x: Vec<f64>, fs: f64, lo: Option<f64>, hi: Option<f64>, order: usize) -> Vec<f64> {
@@ -709,6 +774,33 @@ mod tests {
         assert!((y[50] - x[503]).abs() < 1e-3);
     }
 
+    /// Traces in lockstep come out exactly as each would alone.
+    #[test]
+    fn sosfiltfilt_lanes_match() {
+        let sos = butter_sos(4, Some(150.0), Some(4000.0), 10_000.0).unwrap();
+        let xs: [Vec<f64>; 2] = std::array::from_fn(|l| (0..20_001).map(|i| ((i * (l + 3) * 7919) % 211) as f64 - 90.0).collect());
+        let mut both: Vec<[f64; 2]> = (0..xs[0].len()).map(|i| [xs[0][i], xs[1][i]]).collect();
+        sosfiltfilt_lanes(&sos, &mut both);
+        for l in 0..2 {
+            let want = sosfiltfilt(&sos, xs[l].clone());
+            assert!(both.iter().zip(&want).all(|(p, q)| p[l].to_bits() == q.to_bits()), "lane {l}");
+        }
+    }
+
+    /// The run-time-sized cascade (above 8 sections) does the same arithmetic as the fixed ones.
+    #[test]
+    fn dyn_sections_match() {
+        let sos = butter_sos(8, Some(150.0), Some(4000.0), 10_000.0).unwrap();
+        assert_eq!(sos.len(), 8);
+        let x: Vec<[f64; 1]> = (0..5000).map(|i| [((i * 7919) % 211) as f64 - 90.0]).collect();
+        let (mut a, mut b) = (x.clone(), x);
+        filtfilt::<Sections<8, 1>, 1>(&sos, &mut a);
+        filtfilt::<SectionsDyn<1>, 1>(&sos, &mut b);
+        assert!(a.iter().zip(&b).all(|(p, q)| p[0].to_bits() == q[0].to_bits()));
+        let high = butter_sos(10, Some(150.0), Some(4000.0), 10_000.0).unwrap();
+        assert_eq!(sosfiltfilt(&high, vec![1.0; 5000]).len(), 5000); // 10 sections: no panic
+    }
+
     /// Reading the input a block at a time (process_from) gives exactly what process() gives.
     #[test]
     fn process_from_matches_process() {
@@ -731,4 +823,5 @@ mod tests {
         }
     }
 }
+
 
