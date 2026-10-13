@@ -117,17 +117,44 @@ impl Recording {
                 piece.push(out);
             }
         }
+        // A binary recording's continuous.dat is read with ordinary reads, 256 kB at a time (a
+        // buffer that stays in the CPU's cache): through the memory map every page costs a page
+        // fault, which on macOS made reading take ~2x longer than all the filtering. On Linux the
+        // two are about equally fast. NWB recordings, and any read error, use the map.
+        let dat = std::fs::File::open(c.dir().join("continuous.dat"))
+            .ok()
+            .filter(|f| f.metadata().is_ok_and(|m| m.len() == (c.n_samples() * nc * 2) as u64));
         pieces.into_par_iter().enumerate().for_each(|(p, mut outs)| {
             let a = first + p * part;
             let b = (a + part).min(first + n);
+            let mut gather = |rows: &[i16], i0: usize| {
+                for (i, row) in rows.chunks_exact(nc).enumerate() {
+                    for (out, &ch) in outs.iter_mut().zip(chans) {
+                        out[i0 + i] = row[ch];
+                    }
+                }
+            };
+            if let Some(f) = dat.as_ref().filter(|_| cfg!(target_endian = "little")) {
+                let per = (256 << 10) / (2 * nc);
+                let mut buf = vec![0i16; per * nc];
+                let mut r = a;
+                while r < b {
+                    let k = per.min(b - r);
+                    let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut buf[..k * nc]);
+                    if read_at(f, bytes, (r * nc * 2) as u64).is_err() {
+                        break;
+                    }
+                    gather(&buf[..k * nc], r - a);
+                    r += k;
+                }
+                if r == b {
+                    return;
+                }
+            }
             let mut i = 0;
             for blk in c.blocks(a..b) {
-                for row in blk.chunks_exact(nc) {
-                    for (out, &ch) in outs.iter_mut().zip(chans) {
-                        out[i] = row[ch];
-                    }
-                    i += 1;
-                }
+                gather(&blk, i);
+                i += blk.len() / nc;
             }
         });
         cols
@@ -170,4 +197,26 @@ pub fn check_sync(rec: &Recording, n_frames: usize, line: i64, video_duration: O
         extra: a.extra as i64,
         period: a.period,
     })
+}
+
+/// Fill buf from the file at byte offset `at` (positional: threads may share the file).
+fn read_at(f: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(f, buf, at)
+    }
+    #[cfg(windows)]
+    {
+        let (mut done, mut buf) = (0u64, buf);
+        while !buf.is_empty() {
+            match std::os::windows::fs::FileExt::seek_read(f, buf, at + done)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                k => {
+                    done += k as u64;
+                    buf = &mut buf[k..];
+                }
+            }
+        }
+        Ok(())
+    }
 }
