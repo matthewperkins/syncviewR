@@ -2,15 +2,17 @@
 //! (port of syncview/data/cache.py; same folder layout, so Python and Rust can share a cache).
 //!
 //! Layout:  <root>/<spec_key>/
-//!             level0.npy             processed trace, float32, sample k <-> absolute row k*step
+//!             level0.npy             processed trace, sample k <-> absolute row k*step
 //!             min{k}.npy max{k}.npy  min/max over blocks of FACTOR**k level-0 samples (k >= 1)
+//!             (all float16; float32 in caches from before v0.1.6 and Python's, which still load)
 //!             meta.json              written last; its presence marks a complete trace
 
 use crate::filters::{out_step, pad_samples, process, spec_key};
-use crate::npy::{self, F32Array};
+use crate::npy::{self, F32Array, SampleSlice, Samples};
 use crate::oe::Recording;
 use crate::preset::Spec;
 use anyhow::{Context, Result};
+use half::f16;
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -22,11 +24,11 @@ pub const FACTOR: usize = 8;
 const CHUNK_S: f64 = 600.0; // seconds of data processed per chunk (plus filter padding on each side)
 
 pub struct Trace {
-    pub y: F32Array,
+    pub y: Samples,
     pub dt: f64,
     pub t0: f64,
-    pub mins: Vec<F32Array>, // level k >= 1 (level 0 is y)
-    pub maxs: Vec<F32Array>,
+    pub mins: Vec<Samples>, // level k >= 1 (level 0 is y)
+    pub maxs: Vec<Samples>,
     pub stats: Map<String, Value>,
 }
 
@@ -37,11 +39,11 @@ impl Trace {
         let (mut mn, mut mx) = (y.clone(), y.clone());
         while mn.len() / FACTOR >= 256 {
             (mn, mx) = reduce(&mn, &mx);
-            mins.push(F32Array::Owned(mn.clone()));
-            maxs.push(F32Array::Owned(mx.clone()));
+            mins.push(Samples::F32(F32Array::Owned(mn.clone())));
+            maxs.push(Samples::F32(F32Array::Owned(mx.clone())));
         }
-        let stats = stats(&y);
-        Trace { y: F32Array::Owned(y), dt, t0, mins, maxs, stats }
+        let stats = stats(SampleSlice::F32(&y));
+        Trace { y: Samples::F32(F32Array::Owned(y)), dt, t0, mins, maxs, stats }
     }
 
     fn open(folder: &Path) -> Result<Self> {
@@ -50,11 +52,11 @@ impl Trace {
         let mut mins = vec![];
         let mut maxs = vec![];
         for k in 1..=levels {
-            mins.push(npy::load_f32(&folder.join(format!("min{k}.npy")))?);
-            maxs.push(npy::load_f32(&folder.join(format!("max{k}.npy")))?);
+            mins.push(npy::load_samples(&folder.join(format!("min{k}.npy")))?);
+            maxs.push(npy::load_samples(&folder.join(format!("max{k}.npy")))?);
         }
         Ok(Trace {
-            y: npy::load_f32(&folder.join("level0.npy"))?,
+            y: npy::load_samples(&folder.join("level0.npy"))?,
             dt: meta["dt"].as_f64().context("meta.json: dt")?,
             t0: 0.0,
             mins,
@@ -78,19 +80,19 @@ impl Trace {
         let (t_lo, t_hi) = (t_lo - off, t_hi - off);
         let span = t_hi - t_lo;
         let per_px = span / self.dt / n_px;
-        let y = self.y.as_slice();
+        let y = self.y.slice();
         if per_px < 2.0 {
             let a = ((t_lo / self.dt).floor() as i64 - 1).max(0) as usize;
             let b = (((t_hi / self.dt).ceil() as i64 + 2).max(0) as usize).min(y.len());
             for i in a..b.max(a) {
                 xs.push(off + i as f64 * self.dt);
-                ys.push(y[i]);
+                ys.push(y.get(i));
             }
             return;
         }
         let k = ((per_px.ln() / (FACTOR as f64).ln()) as usize).min(self.mins.len());
         let blk = self.dt * (FACTOR as f64).powi(k as i32);
-        let (mn, mx) = if k == 0 { (y, y) } else { (self.mins[k - 1].as_slice(), self.maxs[k - 1].as_slice()) };
+        let (mn, mx) = if k == 0 { (y, y) } else { (self.mins[k - 1].slice(), self.maxs[k - 1].slice()) };
         let w = span / n_px;
         let m0 = (t_lo / w).floor() as i64 - 1;
         let m1 = (t_hi / w).ceil() as i64 + 1;
@@ -99,8 +101,7 @@ impl Trace {
         for m in m0..m1 {
             let e1 = edge(m + 1);
             if e1 > e0 {
-                let lo = mn[e0..e1].iter().copied().fold(f32::INFINITY, f32::min);
-                let hi = mx[e0..e1].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let (lo, hi) = if k == 0 { y.min_max(e0, e1) } else { (mn.min_max(e0, e1).0, mx.min_max(e0, e1).1) };
                 let t = off + (m as f64 + 0.5) * w;
                 xs.extend([t, t]);
                 ys.extend([lo, hi]);
@@ -117,8 +118,8 @@ fn reduce(mn: &[f32], mx: &[f32]) -> (Vec<f32>, Vec<f32>) {
 }
 
 /// Percentiles of (a subsample of) y, as Python's cache writes them.
-fn stats(y: &[f32]) -> Map<String, Value> {
-    let mut sub: Vec<f64> = y.iter().step_by((y.len() / 2_000_000).max(1)).map(|v| *v as f64).filter(|v| v.is_finite()).collect();
+fn stats(y: SampleSlice) -> Map<String, Value> {
+    let mut sub: Vec<f64> = (0..y.len()).step_by((y.len() / 2_000_000).max(1)).map(|i| y.get(i) as f64).filter(|v| v.is_finite()).collect();
     let mut out = Map::new();
     if sub.is_empty() {
         return out;
@@ -213,7 +214,7 @@ impl TraceCache {
             for (d, st) in tmp.iter().zip(&steps) {
                 let _ = std::fs::remove_dir_all(d);
                 std::fs::create_dir_all(d)?;
-                maps.push(npy::create_f32_mmap(&d.join("level0.npy"), n.div_ceil(*st))?);
+                maps.push(npy::create_f16_mmap(&d.join("level0.npy"), n.div_ceil(*st))?);
             }
             // the channels the specs need, each read once per chunk
             let mut chans: Vec<usize> = vec![];
@@ -233,7 +234,7 @@ impl TraceCache {
             // Each (chunk, spec) pair is its own task, so a chunk's quick specs don't wait for its
             // slow ones and the next chunk is read while this one is filtered. Chunk boundaries and
             // arithmetic are unchanged, so the cached values are too.
-            let maps: Vec<Mutex<npy::F32MapMut>> = maps.into_iter().map(Mutex::new).collect();
+            let maps: Vec<Mutex<npy::F16MapMut>> = maps.into_iter().map(Mutex::new).collect();
             let n_chunks = n.div_ceil(chunk);
             let n_tasks = n_chunks * specs.len();
             let done = AtomicUsize::new(0);
@@ -286,7 +287,7 @@ impl TraceCache {
                                     let out = map.as_mut_slice();
                                     for (k, v) in y[k0..k1].iter().enumerate() {
                                         if o0 + k < out.len() {
-                                            out[o0 + k] = *v as f32;
+                                            out[o0 + k] = npy::to_f16(*v);
                                         }
                                     }
                                     Ok(())
@@ -310,7 +311,7 @@ impl TraceCache {
             if halted.into_inner() {
                 return Ok(false);
             }
-            let maps: Vec<npy::F32MapMut> = maps.into_iter().map(|m| m.into_inner().unwrap()).collect();
+            let maps: Vec<npy::F16MapMut> = maps.into_iter().map(|m| m.into_inner().unwrap()).collect();
             // finish each trace (zoom pyramid, stats, metadata, move into place) in parallel; the
             // mapped level0 files need no flush, as readers map the same pages
             if cancel() {
@@ -324,7 +325,7 @@ impl TraceCache {
                     m.remove("show");
                 }
                 let meta = json!({"spec": spec_json, "step": st, "dt": *st as f64 / fs, "n": y.len(), "levels": levels,
-                                  "stats": stats(y), "built": format!("syncviewr {}", env!("CARGO_PKG_VERSION"))});
+                                  "stats": stats(SampleSlice::F16(y)), "built": format!("syncviewr {}", env!("CARGO_PKG_VERSION"))});
                 std::fs::write(d.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
                 Ok(())
             })?;
@@ -350,19 +351,20 @@ fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
-fn build_pyramid(y: &[f32], folder: &Path) -> Result<usize> {
+fn build_pyramid(y: &[f16], folder: &Path) -> Result<usize> {
     if y.len() / FACTOR < 256 {
         return Ok(0);
     }
-    let (mut mn, mut mx) = reduce(y, y);
+    let (mut mn, mut mx): (Vec<f32>, Vec<f32>) = y.chunks(FACTOR).map(|c| SampleSlice::F16(c).min_max(0, c.len())).unzip();
     let mut k = 1;
-    npy::write_f32(&folder.join("min1.npy"), &mn)?;
-    npy::write_f32(&folder.join("max1.npy"), &mx)?;
+    // (exact: every value is one of level 0's float16s)
+    npy::write_f16(&folder.join("min1.npy"), &mn)?;
+    npy::write_f16(&folder.join("max1.npy"), &mx)?;
     while mn.len() / FACTOR >= 256 {
         (mn, mx) = reduce(&mn, &mx);
         k += 1;
-        npy::write_f32(&folder.join(format!("min{k}.npy")), &mn)?;
-        npy::write_f32(&folder.join(format!("max{k}.npy")), &mx)?;
+        npy::write_f16(&folder.join(format!("min{k}.npy")), &mn)?;
+        npy::write_f16(&folder.join(format!("max{k}.npy")), &mx)?;
     }
     Ok(k)
 }

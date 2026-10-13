@@ -143,8 +143,9 @@ Remove and as the template for Add. **Load…/Save…** read and write presets i
 
 **Sharing a cache with Python syncview.** Cache entries use the same keys and layout, so
 `--cache` pointed at a Python syncview cache folder reuses its filtered traces and video indexes
-(and vice versa). Slow-mode traces are the exception: syncviewR decimates before filtering them,
-so it keeps its own.
+(and vice versa, untested in that direction since v0.1.6: syncviewR now stores traces as float16,
+half the disk space of Python's float32). Slow-mode traces are the exception: syncviewR decimates
+before filtering them, so it keeps its own.
 
 ## Export a clip
 
@@ -188,6 +189,9 @@ three times, offset by one physical pixel, to get ~2 px lines.
   syncview first to generate the references (55 MB, not in git). Cache keys match Python's exactly.
 - **Whole-session cache:** against Python's cache for a 10-minute excerpt: same lengths and pyramid
   depth, identical statistics, differences at float32 rounding. Built 17 traces in 5 s (Python ≈ 33 s).
+  Since v0.1.6 traces are stored as float16: on a 2.2 h recording the cache shrinks from 3.3 to
+  1.7 GB, values differ from float32 by 0.02% (median; at most ~2 µV on spikes of thousands of µV),
+  and 160 of 1.7 million screenshot pixels change.
 - **Video:** frames at 14 indexes (incl. both sides of keyframes and the last frame) are the same
   frames Python's decoder returns (mean grey difference 0.005 vs ≥ 0.33 between neighbours).
 - **GUI:** Linux (Hyprland/Wayland, Vulkan, NVIDIA T400), 1648×983, 16 rows + video playing at 1×:
