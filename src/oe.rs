@@ -105,6 +105,29 @@ impl Recording {
     /// Stored values of several channels for rows [first, first + n), one column per channel, in
     /// one pass over the rows (reading channels one at a time reads every row once per channel).
     pub fn raw_columns(&self, chans: &[usize], first: usize, n: usize) -> Vec<Vec<i16>> {
+        self.raw_columns_by(chans, first, n, true)
+    }
+
+    /// (testing) Time reading `chans` over the whole recording in chunks of `chunk` rows, as a
+    /// whole-session build does, through the memory map and with ordinary reads, twice each.
+    pub fn bench_read(&self, chans: &[usize], chunk: usize) {
+        let n = self.n_samples();
+        let gb = (n * self.cont().n_channels() * 2) as f64 / 1e9;
+        println!("reading {} of {} channels, {:.2} GB of continuous.dat, in {} chunks, on {} threads", chans.len(), self.cont().n_channels(), gb, n.div_ceil(chunk), rayon::current_num_threads());
+        for (name, plain) in [("memory map", false), ("ordinary reads", true), ("memory map", false), ("ordinary reads", true)] {
+            let t = std::time::Instant::now();
+            let mut c0 = 0;
+            while c0 < n {
+                let len = chunk.min(n - c0);
+                std::hint::black_box(self.raw_columns_by(chans, c0, len, plain));
+                c0 += len;
+            }
+            let dt = t.elapsed().as_secs_f64();
+            println!("  {name:<15} {dt:5.2} s  ({:.1} GB/s)", gb / dt);
+        }
+    }
+
+    fn raw_columns_by(&self, chans: &[usize], first: usize, n: usize, plain_reads: bool) -> Vec<Vec<i16>> {
         use rayon::prelude::*;
         let c = self.cont();
         let nc = c.n_channels();
@@ -123,14 +146,22 @@ impl Recording {
         // two are about equally fast. NWB recordings, and any read error, use the map.
         let dat = std::fs::File::open(c.dir().join("continuous.dat"))
             .ok()
+            .filter(|_| plain_reads)
             .filter(|f| f.metadata().is_ok_and(|m| m.len() == (c.n_samples() * nc * 2) as u64));
         pieces.into_par_iter().enumerate().for_each(|(p, mut outs)| {
             let a = first + p * part;
             let b = (a + part).min(first + n);
+            // one column at a time, over at most 256 kB of rows (still in the CPU's cache from
+            // the read): each column is written in order, with no per-element bounds checks
             let mut gather = |rows: &[i16], i0: usize| {
-                for (i, row) in rows.chunks_exact(nc).enumerate() {
+                let per = (256 << 10) / (2 * nc);
+                for (s, sub) in rows.chunks(per * nc).enumerate() {
+                    let at = i0 + s * per;
                     for (out, &ch) in outs.iter_mut().zip(chans) {
-                        out[i0 + i] = row[ch];
+                        let out = &mut out[at..at + sub.len() / nc];
+                        for (o, row) in out.iter_mut().zip(sub.chunks_exact(nc)) {
+                            *o = row[ch];
+                        }
                     }
                 }
             };

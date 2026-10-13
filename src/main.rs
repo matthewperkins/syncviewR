@@ -110,6 +110,9 @@ struct Cli {
     /// (testing) time software and hardware decoding of this video, then exit
     #[arg(long, hide = true, value_name = "VIDEO")]
     bench_video: Option<PathBuf>,
+    /// (testing) time reading the preset's channels from the recording, then exit
+    #[arg(long, hide = true)]
+    bench_read: bool,
 }
 
 /// Window, Dock and ⌘-Tab icon (assets/icon.svg, made by assets/make_icon.py; rendered with
@@ -228,6 +231,22 @@ fn main() -> Result<()> {
             done.codec,
             t0.elapsed().as_secs_f64()
         );
+        return Ok(());
+    }
+    if cli.bench_read {
+        let shell::Start::Viewer(l) = &start else { anyhow::bail!("--bench-read needs one recording") };
+        let rec = oe::Recording::open(&l.rec, cli.stream.as_deref())?;
+        let (p, _) = preset::check(shell::load_preset(&l.preset, &rec)?, &rec);
+        let mut chans: Vec<usize> = vec![];
+        for s in p.channels.iter().filter(|s| s.show).chain(&p.overview) {
+            let r = s.reference.as_deref().filter(|r| !r.is_empty()).and_then(|r| rec.ch(r));
+            for c in rec.ch(&s.ch).into_iter().chain(r) {
+                if !chans.contains(&c) {
+                    chans.push(c);
+                }
+            }
+        }
+        rec.bench_read(&chans, (600.0 * rec.fs) as usize);
         return Ok(());
     }
     if cli.build_only {
