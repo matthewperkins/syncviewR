@@ -240,6 +240,9 @@ fn main() -> Result<()> {
         let t0 = std::time::Instant::now();
         cache.build(&specs, &|f| eprint!("\rbuilding {:.0}%", f * 100.0), &|| false)?;
         eprintln!("\nsyncviewr: built {} traces in {:.1} s", specs.len(), t0.elapsed().as_secs_f64());
+        if let Some(t) = cache.last_build.lock().unwrap().as_ref() {
+            eprintln!("{t}");
+        }
         return Ok(());
     }
     let settings = shell::Settings { cache_root: root, stream: cli.stream, trigger_line: cli.trigger_line, time_base: cli.time_base, play: cli.play };

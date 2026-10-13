@@ -148,13 +148,41 @@ pub struct TraceCache {
     pub root: PathBuf,
     rec_dir: String,
     open: Mutex<HashMap<String, Arc<Trace>>>,
+    /// where the last completed build() spent its time (printed by --build-only)
+    pub last_build: Mutex<Option<BuildTimes>>,
+}
+
+/// Where a whole-session build spends its time.
+#[derive(Default, Debug)]
+pub struct BuildTimes {
+    pub total: f64,             // wall seconds, whole build
+    pub chunks: f64,            // wall seconds reading and filtering
+    pub read: f64,              // wall seconds reading raw data (the builder thread; overlaps filtering)
+    pub filter: Vec<(String, usize, f64)>, // per mode: traces, CPU seconds filtering (all threads)
+    pub finish: f64,            // wall seconds for zoom levels, statistics and moving into place
+    pub threads: usize,
+}
+
+impl std::fmt::Display for BuildTimes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "  setup                {:5.1} s wall (creating the output files)", self.total - self.chunks - self.finish)?;
+        writeln!(f, "  reading + filtering  {:5.1} s wall (reading {:.1} s of it, overlapped with filtering)", self.chunks, self.read)?;
+        for (mode, n, cpu) in &self.filter {
+            let traces = if *n == 1 { "trace " } else { "traces" };
+            writeln!(f, "    {mode:<10} {n:2} {traces}  {cpu:6.1} CPU-s")?;
+        }
+        let cpu: f64 = self.filter.iter().map(|x| x.2).sum();
+        writeln!(f, "    {:<10}            {cpu:6.1} CPU-s on {} threads (= {:.1} s if perfectly parallel)", "all", self.threads, cpu / self.threads as f64)?;
+        writeln!(f, "  zoom levels, stats   {:5.1} s wall", self.finish)?;
+        write!(f, "  total                {:5.1} s", self.total)
+    }
 }
 
 impl TraceCache {
     pub fn new(rec: Arc<Recording>, root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root).with_context(|| format!("creating cache folder {}", root.display()))?;
         let rec_dir = rec.rec_dir.to_string_lossy().into_owned();
-        Ok(TraceCache { rec, root, rec_dir, open: Mutex::new(HashMap::new()) })
+        Ok(TraceCache { rec, root, rec_dir, open: Mutex::new(HashMap::new()), last_build: Mutex::new(None) })
     }
 
     pub fn key(&self, spec: &Spec) -> String {
@@ -200,6 +228,7 @@ impl TraceCache {
     /// Process every not-yet-cached spec over the whole recording. progress(fraction) as pieces
     /// finish (from worker threads); cancel() returning true aborts (partial results are removed). Returns Ok(false) if cancelled.
     pub fn build(&self, specs: &[Spec], progress: &(dyn Fn(f64) + Sync), cancel: &(dyn Fn() -> bool + Sync)) -> Result<bool> {
+        let t_build = std::time::Instant::now();
         let specs = self.missing(specs);
         if specs.is_empty() {
             return Ok(true);
@@ -252,6 +281,9 @@ impl TraceCache {
                 }
                 stop
             };
+            let t_chunks = std::time::Instant::now();
+            let t_read = Mutex::new(0.0f64);
+            let t_mode: Mutex<HashMap<String, f64>> = Mutex::new(HashMap::new());
             rayon::in_place_scope_fifo(|scope| {
                 for i in 0..n_chunks {
                     // at most two chunks in memory: wait for chunk i-2 to finish before reading chunk i
@@ -269,10 +301,12 @@ impl TraceCache {
                     let c0 = i * chunk;
                     let c1 = (c0 + chunk).min(n);
                     let (first, len) = rec.clip(c0 as i64 - pad, c1 as i64 + pad);
+                    let tr = std::time::Instant::now();
                     let cols = Arc::new(rec.raw_columns(&chans, first, len));
+                    *t_read.lock().unwrap() += tr.elapsed().as_secs_f64();
                     for (j, s) in specs.iter().enumerate() {
                         let (cols, bv, maps, steps, wanted) = (cols.clone(), &bv, &maps, &steps, &wanted);
-                        let (done, error, in_flight, stopped) = (&done, &error, &in_flight, &stopped);
+                        let (done, error, in_flight, stopped, t_mode) = (&done, &error, &in_flight, &stopped, &t_mode);
                         scope.spawn_fifo(move |_| {
                             if !stopped() {
                                 let (st, (a, r)) = (steps[j], wanted[j]);
@@ -313,7 +347,9 @@ impl TraceCache {
                                     }
                                     Ok(())
                                 };
+                                let tt = std::time::Instant::now();
                                 let res = run();
+                                *t_mode.lock().unwrap().entry(s.mode.clone()).or_default() += tt.elapsed().as_secs_f64();
                                 if let Err(e) = res {
                                     error.lock().unwrap().get_or_insert(e);
                                 }
@@ -327,6 +363,7 @@ impl TraceCache {
                     }
                 }
             });
+            let chunks_s = t_chunks.elapsed().as_secs_f64();
             if let Some(e) = error.into_inner().unwrap() {
                 return Err(e);
             }
@@ -339,6 +376,7 @@ impl TraceCache {
             if cancel() {
                 return Ok(false);
             }
+            let t_finish = std::time::Instant::now();
             specs.par_iter().zip(&steps).zip(&tmp).zip(&maps).try_for_each(|(((s, st), d), map)| -> Result<()> {
                 let y = map.as_slice();
                 let levels = build_pyramid(y, d)?;
@@ -358,6 +396,17 @@ impl TraceCache {
                 let _ = std::fs::remove_dir_all(&fin);
                 std::fs::rename(d, &fin).with_context(|| format!("moving {} into place", d.display()))?;
             }
+            let mut filter: Vec<(String, usize, f64)> =
+                t_mode.into_inner().unwrap().into_iter().map(|(m, t)| (specs.iter().filter(|s| s.mode == m).count(), m, t)).map(|(n, m, t)| (m, n, t)).collect();
+            filter.sort_by(|a, b| b.2.total_cmp(&a.2));
+            *self.last_build.lock().unwrap() = Some(BuildTimes {
+                total: t_build.elapsed().as_secs_f64(),
+                chunks: chunks_s,
+                read: t_read.into_inner().unwrap(),
+                filter,
+                finish: t_finish.elapsed().as_secs_f64(),
+                threads: rayon::current_num_threads(),
+            });
             Ok(true)
         })();
         if !matches!(result, Ok(true)) {
