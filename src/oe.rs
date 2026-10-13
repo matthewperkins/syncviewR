@@ -108,34 +108,29 @@ impl Recording {
         use rayon::prelude::*;
         let c = self.cont();
         let nc = c.n_channels();
-        // split the rows between threads; each fills its own piece of every column
+        let mut cols: Vec<Vec<i16>> = chans.iter().map(|_| vec![0; n]).collect();
+        // split the rows between threads; each fills its own piece of every column, in place
         let part = n.div_ceil(rayon::current_num_threads().max(1)).max(65_536);
-        let pieces: Vec<Vec<Vec<i16>>> = (first..first + n)
-            .step_by(part)
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|a| {
-                let b = (a + part).min(first + n);
-                let mut out: Vec<Vec<i16>> = chans.iter().map(|_| Vec::with_capacity(b - a)).collect();
-                for blk in c.blocks(a..b) {
-                    for row in blk.chunks_exact(nc) {
-                        for (col, &ch) in out.iter_mut().zip(chans) {
-                            col.push(row[ch]);
-                        }
+        let mut pieces: Vec<Vec<&mut [i16]>> = (0..n.div_ceil(part)).map(|_| vec![]).collect();
+        for col in cols.iter_mut() {
+            for (piece, out) in pieces.iter_mut().zip(col.chunks_mut(part)) {
+                piece.push(out);
+            }
+        }
+        pieces.into_par_iter().enumerate().for_each(|(p, mut outs)| {
+            let a = first + p * part;
+            let b = (a + part).min(first + n);
+            let mut i = 0;
+            for blk in c.blocks(a..b) {
+                for row in blk.chunks_exact(nc) {
+                    for (out, &ch) in outs.iter_mut().zip(chans) {
+                        out[i] = row[ch];
                     }
+                    i += 1;
                 }
-                out
-            })
-            .collect();
-        (0..chans.len())
-            .map(|k| {
-                let mut col = Vec::with_capacity(n);
-                for p in &pieces {
-                    col.extend_from_slice(&p[k]);
-                }
-                col
-            })
-            .collect()
+            }
+        });
+        cols
     }
 
     pub fn bit_volts(&self, ch: usize) -> f64 {
