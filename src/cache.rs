@@ -7,7 +7,7 @@
 //!             (all float16; float32 in caches from before v0.1.6 and Python's, which still load)
 //!             meta.json              written last; its presence marks a complete trace
 
-use crate::filters::{out_step, pad_samples, process, spec_key};
+use crate::filters::{out_step, pad_samples, process, process_from, spec_key};
 use crate::npy::{self, F32Array, SampleSlice, Samples};
 use crate::oe::Recording;
 use crate::preset::Spec;
@@ -22,6 +22,10 @@ use std::sync::{Arc, Condvar, Mutex};
 
 pub const FACTOR: usize = 8;
 const CHUNK_S: f64 = 600.0; // seconds of data processed per chunk (plus filter padding on each side)
+// Full-rate EMG ("hilo") is filtered in blocks this long (plus the mode's 1 s padding each side),
+// small enough to stay in the CPU's cache. Measured on a 2.2 h recording: 5 s was fastest (1 s and
+// 30 s blocks were 15-20% slower), and the cached float16 values were identical to 10-minute chunks.
+const BLOCK_S: f64 = 5.0;
 
 pub struct Trace {
     pub y: Samples,
@@ -232,10 +236,10 @@ impl TraceCache {
             }
             let bv: Vec<f64> = chans.iter().map(|c| rec.bit_volts(*c)).collect();
             // Each (chunk, spec) pair is its own task, so a chunk's quick specs don't wait for its
-            // slow ones and the next chunk is read while this one is filtered. Chunk boundaries and
-            // arithmetic are unchanged, so the cached values are too.
+            // slow ones and the next chunk is read while this one is filtered.
             let maps: Vec<Mutex<npy::F16MapMut>> = maps.into_iter().map(Mutex::new).collect();
             let n_chunks = n.div_ceil(chunk);
+            let block_len = (BLOCK_S * fs) as usize;
             let n_tasks = n_chunks * specs.len();
             let done = AtomicUsize::new(0);
             let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -273,26 +277,44 @@ impl TraceCache {
                             if !stopped() {
                                 let (st, (a, r)) = (steps[j], wanted[j]);
                                 let run = || -> Result<()> {
-                                    // same arithmetic as Recording::trace, so cached values don't change
-                                    let x: Vec<f64> = match r {
-                                        None => cols[a].iter().map(|v| *v as f64 * bv[a]).collect(),
-                                        Some(b) => cols[a].iter().zip(&cols[b]).map(|(u, w)| *u as f64 * bv[a] - *w as f64 * bv[b]).collect(),
-                                    };
-                                    let (y, a, st2) = process(x, first as i64, fs, s)?;
-                                    debug_assert_eq!(st2 as usize, st);
-                                    let k0 = ((c0 as i64 - a) / st as i64).max(0) as usize;
-                                    let k1 = (k0 + (c1 - c0).div_ceil(st)).min(y.len());
-                                    let o0 = c0 / st;
-                                    let mut map = maps[j].lock().unwrap();
-                                    let out = map.as_mut_slice();
-                                    for (k, v) in y[k0..k1].iter().enumerate() {
-                                        if o0 + k < out.len() {
-                                            out[o0 + k] = npy::to_f16(*v);
+                                    // Full-rate EMG is filtered in short blocks (each with the
+                                    // mode's own padding) that stay in the CPU's cache, instead of
+                                    // streaming a 10-minute chunk through memory several times.
+                                    let block = if s.mode == "hilo" { block_len } else { c1 - c0 };
+                                    let spad = if s.mode == "hilo" { pad_samples(s, fs) as i64 } else { pad };
+                                    let mut b0 = c0;
+                                    while b0 < c1 {
+                                        let b1 = (b0 + block).min(c1);
+                                        let (bf, bl) = rec.clip(b0 as i64 - spad, b1 as i64 + spad);
+                                        // x[i] of this block, in the same arithmetic as Recording::trace
+                                        let fill = |i: usize, out: &mut [f64]| {
+                                            let u = &cols[a][bf - first + i..bf - first + i + out.len()];
+                                            match r {
+                                                None => out.iter_mut().zip(u).for_each(|(o, v)| *o = *v as f64 * bv[a]),
+                                                Some(b) => {
+                                                    let w = &cols[b][bf - first + i..bf - first + i + out.len()];
+                                                    out.iter_mut().zip(u.iter().zip(w)).for_each(|(o, (p, q))| *o = *p as f64 * bv[a] - *q as f64 * bv[b]);
+                                                }
+                                            }
+                                        };
+                                        let (y, a0, st2) = process_from(bl, &fill, bf as i64, fs, s)?;
+                                        debug_assert_eq!(st2 as usize, st);
+                                        let k0 = ((b0 as i64 - a0) / st as i64).max(0) as usize;
+                                        let k1 = (k0 + (b1 - b0).div_ceil(st)).min(y.len());
+                                        let o0 = b0 / st;
+                                        let mut map = maps[j].lock().unwrap();
+                                        let out = map.as_mut_slice();
+                                        for (k, v) in y[k0..k1].iter().enumerate() {
+                                            if o0 + k < out.len() {
+                                                out[o0 + k] = npy::to_f16(*v);
+                                            }
                                         }
+                                        b0 = b1;
                                     }
                                     Ok(())
                                 };
-                                if let Err(e) = run() {
+                                let res = run();
+                                if let Err(e) = res {
                                     error.lock().unwrap().get_or_insert(e);
                                 }
                                 progress((done.fetch_add(1, Ordering::Relaxed) + 1) as f64 / n_tasks as f64);

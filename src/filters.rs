@@ -449,24 +449,31 @@ pub fn decimation_fir(fs: f64, d: usize, fp: f64) -> Option<Vec<f64>> {
     Some(h)
 }
 
-/// Filter x (first sample at absolute row a) with the centred FIR h, keeping only the samples on
-/// the global grid of `d` rows, like decimate(y, a, 1, d) of the filtered trace: zero phase, and
-/// only the kept samples are computed. The ends are extended by odd reflection (as sosfiltfilt).
-fn fir_decimate(x: &[f64], a: i64, d: usize, h: &[f64]) -> (Vec<f64>, i64) {
-    let n = x.len();
+/// Filter the n samples that fill(i, out) writes (x[i..i + out.len()]; first sample at absolute
+/// row a) with the centred FIR h, keeping only the samples on the global grid of `d` rows, like
+/// decimate(y, a, 1, d) of the filtered trace: zero phase, and only the kept samples are computed.
+/// The ends are extended by odd reflection (as sosfiltfilt). Input is asked for a block at a time,
+/// so a long trace never has to be in memory (or in the CPU's cache) at once.
+fn fir_decimate_from(n: usize, fill: &dyn Fn(usize, &mut [f64]), a: i64, d: usize, h: &[f64]) -> (Vec<f64>, i64) {
     let k0 = (-a).rem_euclid(d as i64) as usize;
     let m = h.len() / 2;
     if n == 0 || k0 >= n {
         return (vec![], a + k0 as i64);
     }
+    let one = |i: usize| {
+        let mut v = [0.0];
+        fill(i, &mut v);
+        v[0]
+    };
+    let (x_first, x_last) = (one(0), one(n - 1));
     let at = |k: i64| -> f64 {
         let last = n as i64 - 1;
         if k < 0 {
-            2.0 * x[0] - x[(-k).min(last) as usize]
+            2.0 * x_first - one((-k).min(last) as usize)
         } else if k > last {
-            2.0 * x[n - 1] - x[(2 * last - k).max(0) as usize]
+            2.0 * x_last - one((2 * last - k).max(0) as usize)
         } else {
-            x[k as usize]
+            one(k as usize)
         }
     };
     let dot = |w: &[f64]| -> f64 {
@@ -484,14 +491,24 @@ fn fir_decimate(x: &[f64], a: i64, d: usize, h: &[f64]) -> (Vec<f64>, i64) {
     };
     let mut out = Vec::with_capacity((n - k0).div_ceil(d));
     let mut buf = vec![0.0; h.len()];
-    for p in (k0..n).step_by(d) {
-        if p >= m && p + m < n {
-            out.push(dot(&x[p - m..p + m + 1]));
-        } else {
-            for (j, b) in buf.iter_mut().enumerate() {
-                *b = at(p as i64 - m as i64 + j as i64);
+    // output samples in groups of `per` (input blocks of ~64k samples plus the FIR's reach)
+    let per = (65_536 / d).max(1);
+    let mut win: Vec<f64> = vec![];
+    let ps: Vec<usize> = (k0..n).step_by(d).collect();
+    for group in ps.chunks(per) {
+        let (g0, g1) = (group[0], group[group.len() - 1]);
+        let (w0, w1) = (g0.saturating_sub(m), (g1 + m + 1).min(n));
+        win.resize(w1 - w0, 0.0);
+        fill(w0, &mut win);
+        for &p in group {
+            if p >= m && p + m < n {
+                out.push(dot(&win[p - m - w0..p + m + 1 - w0]));
+            } else {
+                for (j, b) in buf.iter_mut().enumerate() {
+                    *b = at(p as i64 - m as i64 + j as i64);
+                }
+                out.push(dot(&buf));
             }
-            out.push(dot(&buf));
         }
     }
     (out, a + k0 as i64)
@@ -508,6 +525,56 @@ fn decimate(y: Vec<f64>, a: i64, step: i64, factor: i64) -> Result<(Vec<f64>, i6
     Ok((y.into_iter().skip(k0).step_by(factor as usize).collect(), a + k0 as i64 * step, new))
 }
 
+/// Slow mode's usual path: decimate first, then filter at the plot rate: one FIR pass at the full
+/// rate instead of the notches and the low-pass there. The FIR keeps [0, max(hi, notches)] intact
+/// and blocks everything that would alias into it. None when that doesn't fit (e.g. a notch near
+/// the plot rate's Nyquist). `fill` gives the median-subtracted input (see fir_decimate_from).
+fn slow_decimating_first(p: &P, n: usize, fill: &dyn Fn(usize, &mut [f64]), a: i64, fs: f64, spec: &Spec) -> Option<(Vec<f64>, i64, i64)> {
+    let (lo, hi) = p.band();
+    let order = p.order();
+    let d = out_step(spec, fs);
+    let fs1 = fs / d as f64;
+    let notches = p.notch();
+    let fp = notches.iter().copied().chain(hi).fold(0.0, f64::max);
+    let fits = hi.is_some_and(|h| h < 0.45 * fs1) && notches.iter().all(|f| *f < 0.45 * fs1);
+    let h = decimation_fir(fs, d, fp).filter(|_| fits)?;
+    let (mut y, a) = fir_decimate_from(n, fill, a, d, &h);
+    for f0 in notches {
+        y = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs1)], y);
+    }
+    let y = filt(y, fs1, None, hi, order);
+    let y = filt(y, fs1, lo, None, order);
+    Some((y, a, d as i64))
+}
+
+/// process() of the n samples that fill(i, out) writes (x[i..i + out.len()]). Slow mode reads its
+/// input a block at a time; other modes fill a whole array and call process.
+pub fn process_from(n: usize, fill: &dyn Fn(usize, &mut [f64]), a: i64, fs: f64, spec: &Spec) -> Result<(Vec<f64>, i64, i64)> {
+    if spec.mode == "slow" {
+        let p = P(params(spec)?);
+        // same median as process()
+        let sub: Vec<f64> = (0..n)
+            .step_by((n / 10000).max(1))
+            .map(|i| {
+                let mut v = [0.0];
+                fill(i, &mut v);
+                v[0]
+            })
+            .collect();
+        let med = crate::oe::median(&sub);
+        let centred = |i: usize, out: &mut [f64]| {
+            fill(i, out);
+            out.iter_mut().for_each(|v| *v -= med);
+        };
+        if let Some(r) = slow_decimating_first(&p, n, &centred, a, fs, spec) {
+            return Ok(r);
+        }
+    }
+    let mut x = vec![0.0; n];
+    fill(0, &mut x);
+    process(x, a, fs, spec)
+}
+
 /// Apply the spec's mode to raw trace x (physical units) whose first sample is absolute row a.
 /// Returns (y, a_out, step): y[k] belongs to absolute row a_out + k*step.
 pub fn process(x: Vec<f64>, a: i64, fs: f64, spec: &Spec) -> Result<(Vec<f64>, i64, i64)> {
@@ -517,25 +584,10 @@ pub fn process(x: Vec<f64>, a: i64, fs: f64, spec: &Spec) -> Result<(Vec<f64>, i
     let mut x: Vec<f64> = x.into_iter().map(|v| v - med).collect();
     let (lo, hi) = p.band();
     let order = p.order();
-    if spec.mode == "slow" {
-        // Decimate first, then filter at the plot rate: one FIR pass at the full rate instead of
-        // the notches and the low-pass there. The FIR keeps [0, max(hi, notches)] intact and
-        // blocks everything that would alias into it.
-        let d = out_step(spec, fs);
-        let fs1 = fs / d as f64;
-        let notches = p.notch();
-        let fp = notches.iter().copied().chain(hi).fold(0.0, f64::max);
-        let fits = hi.is_some_and(|h| h < 0.45 * fs1) && notches.iter().all(|f| *f < 0.45 * fs1);
-        if let Some(h) = decimation_fir(fs, d, fp).filter(|_| fits) {
-            let (mut y, a) = fir_decimate(&x, a, d, &h);
-            drop(x);
-            for f0 in notches {
-                y = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs1)], y);
-            }
-            let y = filt(y, fs1, None, hi, order);
-            let y = filt(y, fs1, lo, None, order);
-            return Ok((y, a, d as i64));
-        }
+    if spec.mode == "slow"
+        && let Some(r) = slow_decimating_first(&p, x.len(), &|i, out: &mut [f64]| out.copy_from_slice(&x[i..i + out.len()]), a, fs, spec)
+    {
+        return Ok(r);
     }
     for f0 in p.notch() {
         x = sosfiltfilt(&vec![iirnotch(f0, 30.0, fs)], x);
@@ -652,9 +704,23 @@ mod tests {
         assert!(decimation_fir(10_000.0, 10, 450.0).is_none(), "too close to the new Nyquist");
         // kept samples sit on the global grid, like decimate()
         let x: Vec<f64> = (0..1000).map(|i| (i as f64 * 0.01).sin()).collect();
-        let (y, a) = fir_decimate(&x, 7, 10, &h);
+        let (y, a) = fir_decimate_from(x.len(), &|i, o: &mut [f64]| o.copy_from_slice(&x[i..i + o.len()]), 7, 10, &h);
         assert_eq!((a, y.len()), (10, 100));
         assert!((y[50] - x[503]).abs() < 1e-3);
+    }
+
+    /// Reading the input a block at a time (process_from) gives exactly what process() gives.
+    #[test]
+    fn process_from_matches_process() {
+        let fs = 10_000.0;
+        let x: Vec<f64> = (0..1_234_567).map(|i| (i as f64 * 0.0013).sin() * 50.0 + ((i * 7919) % 101) as f64 - 40.0).collect();
+        for mode in ["slow", "hilo", "bandpower"] {
+            let spec: Spec = serde_json::from_value(serde_json::json!({"ch": "CH1", "mode": mode})).unwrap();
+            let want = process(x.clone(), 12_345, fs, &spec).unwrap();
+            let got = process_from(x.len(), &|i, o: &mut [f64]| o.copy_from_slice(&x[i..i + o.len()]), 12_345, fs, &spec).unwrap();
+            assert_eq!((got.1, got.2), (want.1, want.2), "{mode}");
+            assert!(got.0.iter().zip(&want.0).all(|(p, q)| p.to_bits() == q.to_bits()) && got.0.len() == want.0.len(), "{mode}");
+        }
     }
 
     #[test]
