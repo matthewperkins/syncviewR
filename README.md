@@ -175,11 +175,12 @@ choice for slides.
 
 ## How it draws
 
-Each row is one GPU line strip (`src/gpu.rs`), drawn inside egui's render pass through an
+Each row is one GPU polyline (`src/gpu.rs`), drawn inside egui's render pass through an
 `egui_wgpu` paint callback. As in syncview, a row never has more points than pixel columns: the
 whole session is filtered once into a min/max pyramid on disk (`src/cache.rs`), and each frame reads
-the coarsest level with at least one block per pixel column. On high-DPI screens each strip is drawn
-three times, offset by one physical pixel, to get ~2 px lines.
+the coarsest level with at least one block per pixel column. Each segment is drawn as a quad with
+antialiased sides, one logical pixel wide, so lines stay continuous on 1x screens too
+(`SYNCVIEWR_LINE_PX` sets another width, in physical pixels).
 
 ## Checked
 

@@ -6,7 +6,7 @@ use crate::filters::MODES;
 use crate::oe::{check_sync, Recording};
 use crate::preset::{self, Preset, Spec};
 use crate::video::{video_duration, VideoDecoder};
-use crate::gpu::{offsets_for, LineStrip};
+use crate::gpu::{px_for, LineStrip};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use eframe::egui_wgpu;
 use std::path::PathBuf;
@@ -993,7 +993,7 @@ impl App {
                         .zip(&ys)
                         .map(|(x, y)| [((x - t) / (span / 2.0)) as f32, (((*y as f64 - lo) / (hi - lo)) * 2.0 - 1.0) as f32])
                         .collect();
-                    let cb = LineStrip { slot: i, points, color: self.rows[i].color, offsets: offsets_for(r, ppp) };
+                    let cb = LineStrip { slot: i, points, color: self.rows[i].color, px: px_for(r, ppp) };
                     ui.painter().with_clip_rect(r.intersect(rect)).add(egui_wgpu::Callback::new_paint_callback(r, cb));
                 }
             }
@@ -1079,7 +1079,7 @@ impl App {
                         .zip(&ys)
                         .map(|(x, y)| [((x / dur) * 2.0 - 1.0) as f32, (((*y as f64 - lo) / (hi - lo)) * 2.0 - 1.0) as f32])
                         .collect();
-                    let cb = LineStrip { slot: OVERVIEW_SLOT, points, color: FG, offsets: offsets_for(plot, ppp) };
+                    let cb = LineStrip { slot: OVERVIEW_SLOT, points, color: FG, px: px_for(plot, ppp) };
                     ui.painter().with_clip_rect(plot).add(egui_wgpu::Callback::new_paint_callback(plot, cb));
                     // a few y labels
                     let target = (hi - lo) / 2.0;
